@@ -1,0 +1,27 @@
+# Local source checkouts and build outputs
+/build/
+/sources/
+/artifacts/
+/package/
+/dist/
+
+# Runtime binaries and archives are intentionally excluded
+*.dll
+*.exe
+*.addon32
+*.addon64
+*.pdb
+*.lib
+*.bin
+*.zip
+*.7z
+*.rar
+
+# Local logs, caches, and editor state
+*.log
+.vs/
+.vscode/
+.idea/
+__pycache__/
+Thumbs.db
+desktop.ini

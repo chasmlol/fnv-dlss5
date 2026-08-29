@@ -1,0 +1,8 @@
+diff --git a/external-build/meson.build b/external-build/meson.build
+--- a/external-build/meson.build
++++ b/external-build/meson.build
+@@ -16 +16,3 @@
+-enable_sentry = get_option('buildtype') != 'debug'
++# Distribution builds intentionally omit optional crash reporting and do not
++# depend on Sentry's prebuilt debug-symbol bundle.
++enable_sentry = false

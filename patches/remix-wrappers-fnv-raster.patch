@@ -1,0 +1,327 @@
+diff --git a/FalloutNV-Remix-Wrapper/remix-comp.ini b/FalloutNV-Remix-Wrapper/remix-comp.ini
+index 8b024e1..71da239 100644
+--- a/FalloutNV-Remix-Wrapper/remix-comp.ini
++++ b/FalloutNV-Remix-Wrapper/remix-comp.ini
+@@ -16,6 +16,15 @@
+ Enabled=1
+ DLLName=d3d9_remix.dll
+ 
++; ============================================================
++; Vanilla raster + DLSS
++;
++; Keeps New Vegas's original programmable shaders and publishes
++; only camera transforms for the 64-bit DLSS renderer.
++; ============================================================
++[RasterDLSS]
++Enabled=1
++
+ [Chain]
+ ; Semicolon-separated list of DLLs/ASIs to load before the d3d9 chain is established.
+ ; Example: Preload=dinput8.dll;some_other_mod.asi
+@@ -28,7 +37,7 @@ Postload=
+ ; FFP Conversion Settings
+ ; ============================================================
+ [FFP]
+-Enabled=1
++Enabled=0
+ AlbedoStage=0
+ ; Per-decl-shape overrides — edit these between launches to tune.
+ ; Stage values are 0-7 (which texture stage holds the diffuse for that mesh class).
+@@ -116,7 +125,7 @@ NearLodMode=1
+ ; instead of the generic skinning module. Keep this OFF.
+ ; ============================================================
+ [Skinning]
+-Enabled=1
++Enabled=0
+ 
+ ; ============================================================
+ ; Culling Patch (Wall_SoGB's disable-culling patch, ported from NewVegasRTXHelper)
+@@ -140,7 +149,7 @@ Enabled=0
+ ; SetLight/LightEnable. RTX Remix intercepts for path tracing.
+ ; ============================================================
+ [Lights]
+-Enabled=1
++Enabled=0
+ IntensityPercent=100
+ 
+ ; Range mode:
+@@ -172,7 +181,7 @@ OutputDir=captures
+ ; Set Enabled=0 to leave Remix's atmosphere using its own defaults.
+ ; ============================================================
+ [SunCycle]
+-Enabled=1
++Enabled=0
+ 
+ [MoonCycle]
+-Enabled=1
++Enabled=0
+diff --git a/FalloutNV-Remix-Wrapper/src/comp/comp.cpp b/FalloutNV-Remix-Wrapper/src/comp/comp.cpp
+index bc6d320..2b428b0 100644
+--- a/FalloutNV-Remix-Wrapper/src/comp/comp.cpp
++++ b/FalloutNV-Remix-Wrapper/src/comp/comp.cpp
+@@ -219,6 +219,11 @@ namespace comp
+ 
+ 	void on_begin_scene_cb()
+ 	{
++		// Vanilla raster mode must not initialize or update any of the Remix
++		// path-tracing compatibility systems.
++		if (shared::common::config::get().raster_dlss.enabled)
++			return;
++
+ 		if (!tex_addons::initialized) {
+ 			tex_addons::init_texture_addons();
+ 		}
+diff --git a/FalloutNV-Remix-Wrapper/src/comp/d3d9_proxy.cpp b/FalloutNV-Remix-Wrapper/src/comp/d3d9_proxy.cpp
+index 30cbf36..0d147ba 100644
+--- a/FalloutNV-Remix-Wrapper/src/comp/d3d9_proxy.cpp
++++ b/FalloutNV-Remix-Wrapper/src/comp/d3d9_proxy.cpp
+@@ -20,6 +20,69 @@ namespace d3d9_proxy
+ 	static FARPROC pDebugSetLevel = nullptr;
+ 	static FARPROC pDebugSetMute = nullptr;
+ 
++	static void configure_reshade_layer_for_bridge()
++	{
++		// Steam starts FalloutNV.exe from its already-running client, so temporary
++		// launcher environment variables are not reliable. Configure everything
++		// needed by the 64-bit renderer so FalloutNV.exe can be launched
++		// directly.
++		SetEnvironmentVariableW(L"DXVK_FORCE_WINDOWED", L"1");
++
++		wchar_t executable_path[32768]{};
++		const auto path_length = GetModuleFileNameW(
++			nullptr,
++			executable_path,
++			static_cast<DWORD>(std::size(executable_path)));
++
++		if (!path_length || path_length >= std::size(executable_path))
++		{
++			shared::common::log(
++				"Proxy",
++				std::format("Could not resolve game path for private ReShade layer (error 0x{:X})", GetLastError()),
++				shared::common::LOG_TYPE::LOG_TYPE_WARN);
++			return;
++		}
++
++		std::wstring game_path(executable_path, path_length);
++		const auto separator = game_path.find_last_of(L"\\/");
++		if (separator == std::wstring::npos)
++		{
++			shared::common::log(
++				"Proxy",
++				"Could not resolve game directory for private ReShade layer",
++				shared::common::LOG_TYPE::LOG_TYPE_WARN);
++			return;
++		}
++
++		const auto layer_path = game_path.substr(0, separator) + L"\\.trex\\reshade-layer";
++		const auto manifest_path = layer_path + L"\\ReShade64.json";
++		const auto attributes = GetFileAttributesW(manifest_path.c_str());
++
++		if (attributes == INVALID_FILE_ATTRIBUTES || (attributes & FILE_ATTRIBUTE_DIRECTORY))
++		{
++			shared::common::log(
++				"Proxy",
++				"Private ReShade Vulkan layer manifest is missing; bridge will continue without it",
++				shared::common::LOG_TYPE::LOG_TYPE_WARN);
++			return;
++		}
++
++		if (!SetEnvironmentVariableW(L"VK_IMPLICIT_LAYER_PATH", layer_path.c_str()))
++		{
++			shared::common::log(
++				"Proxy",
++				std::format("Could not set private ReShade layer path (error 0x{:X})", GetLastError()),
++				shared::common::LOG_TYPE::LOG_TYPE_WARN);
++			return;
++		}
++
++		SetEnvironmentVariableW(L"VK_ADD_IMPLICIT_LAYER_PATH", nullptr);
++		SetEnvironmentVariableW(L"DISABLE_VK_LAYER_reshade_1", nullptr);
++		shared::common::log(
++			"Proxy",
++			"Direct-launch environment configured for the 64-bit Remix bridge");
++	}
++
+ 	static void resolve_procs(HMODULE mod)
+ 	{
+ 		pDirect3DCreate9                = (PFN_Direct3DCreate9)GetProcAddress(mod, "Direct3DCreate9");
+@@ -72,6 +135,7 @@ namespace d3d9_proxy
+ 		// Try Remix bridge first (e.g. d3d9_remix.dll sitting next to us)
+ 		if (cfg.remix.enabled && !cfg.remix.dll_name.empty())
+ 		{
++			configure_reshade_layer_for_bridge();
+ 			chain_module_ = LoadLibraryA(cfg.remix.dll_name.c_str());
+ 			if (chain_module_)
+ 			{
+diff --git a/FalloutNV-Remix-Wrapper/src/comp/game/game.cpp b/FalloutNV-Remix-Wrapper/src/comp/game/game.cpp
+index cedb573..e860bd0 100644
+--- a/FalloutNV-Remix-Wrapper/src/comp/game/game.cpp
++++ b/FalloutNV-Remix-Wrapper/src/comp/game/game.cpp
+@@ -1172,6 +1172,14 @@ namespace comp::game
+ 
+ 	void install_game_patches()
+ 	{
++		if (shared::common::config::get().raster_dlss.enabled)
++		{
++			shared::common::log("RasterDLSS",
++				"Skipped FNV skinning and culling executable patches",
++				shared::common::LOG_TYPE::LOG_TYPE_GREEN);
++			return;
++		}
++
+ 		// Skinning hooks (hardcoded addresses — FNV specific)
+ 		install_skinning_hooks();
+ 
+diff --git a/FalloutNV-Remix-Wrapper/src/comp/modules/d3d9ex.cpp b/FalloutNV-Remix-Wrapper/src/comp/modules/d3d9ex.cpp
+index 31d3947..ccdfbb8 100644
+--- a/FalloutNV-Remix-Wrapper/src/comp/modules/d3d9ex.cpp
++++ b/FalloutNV-Remix-Wrapper/src/comp/modules/d3d9ex.cpp
+@@ -744,6 +744,9 @@ namespace comp
+ 		PROFILE_ZONE_N("d3d9::SetVSConstF");
+ 		TRACE_IF_ACTIVE(trace_SetVertexShaderConstantF, StartRegister, pConstantData, Vector4fCount);
+ 
++		if (shared::common::config::get().raster_dlss.enabled)
++			return m_pIDirect3DDevice9->SetVertexShaderConstantF(StartRegister, pConstantData, Vector4fCount);
++
+ 		// Redundant-write filter for non-bone constants. count==3 is the bone
+ 		// upload signature consumed by game::on_set_vs_const_f's num_bones /
+ 		// bones_drawn state machine; those must always fire, even with
+@@ -849,6 +852,12 @@ namespace comp
+ 	{
+ 		PROFILE_ZONE_N("d3d9::SetPixelShader");
+ 		TRACE_IF_ACTIVE(trace_SetPixelShader, pShader);
++		if (shared::common::config::get().raster_dlss.enabled)
++		{
++			shared::common::ffp_state::get().on_set_pixel_shader(pShader);
++			return m_pIDirect3DDevice9->SetPixelShader(pShader);
++		}
++
+ 		// Pre-populate the PS classifier cache on first sighting. The renderer
+ 		// queries it per draw to map (sampler name -> slot) and drive the
+ 		// RS-protocol payload that dxvk-remix decodes.
+@@ -869,6 +878,9 @@ namespace comp
+ 		PROFILE_ZONE_N("d3d9::SetPSConstF");
+ 		TRACE_IF_ACTIVE(trace_SetPixelShaderConstantF, StartRegister, pConstantData, Vector4fCount);
+ 
++		if (shared::common::config::get().raster_dlss.enabled)
++			return m_pIDirect3DDevice9->SetPixelShaderConstantF(StartRegister, pConstantData, Vector4fCount);
++
+ 		// Redundant-write filter. PS constants have no game-side handler with
+ 		// state machine — only ffp_state's cache update, which is itself a
+ 		// no-op when data is unchanged.
+diff --git a/FalloutNV-Remix-Wrapper/src/comp/modules/renderer.cpp b/FalloutNV-Remix-Wrapper/src/comp/modules/renderer.cpp
+index 489c36c..34da6b2 100644
+--- a/FalloutNV-Remix-Wrapper/src/comp/modules/renderer.cpp
++++ b/FalloutNV-Remix-Wrapper/src/comp/modules/renderer.cpp
+@@ -205,6 +205,28 @@ namespace comp
+ 
+ 	void renderer_on_reset() { s_world_is_identity_ = true; }
+ 
++	/*
++	 * Raster-DLSS passthrough: leave FNV's programmable shaders, declarations,
++	 * constants, textures, and render states untouched. Fixed-function
++	 * transform state is ignored while a vertex shader is bound, but the Remix
++	 * bridge can still observe it and pass the camera to the 64-bit renderer.
++	 */
++	static void prepare_raster_dlss_draw(IDirect3DDevice9* dev)
++	{
++		auto& ffp = shared::common::ffp_state::get();
++		if (ffp.last_vs() != nullptr)
++			game::apply_transforms(dev);
++
++		static bool logged = false;
++		if (!logged)
++		{
++			shared::common::log("RasterDLSS",
++				"Vanilla draw passthrough active; publishing camera transforms only",
++				shared::common::LOG_TYPE::LOG_TYPE_GREEN);
++			logged = true;
++		}
++	}
++
+ 	/*
+ 	 * FNV-specific FFP engage: uses NiDX9Renderer matrices instead of VS constants.
+ 	 * Calls ffp.engage() for shader nulling + texture stages + lighting,
+@@ -426,6 +448,12 @@ namespace comp
+ 			return dev->DrawPrimitive(PrimitiveType, StartVertex, PrimitiveCount);
+ 		}
+ 
++		if (shared::common::config::get().raster_dlss.enabled)
++		{
++			prepare_raster_dlss_draw(dev);
++			return dev->DrawPrimitive(PrimitiveType, StartVertex, PrimitiveCount);
++		}
++
+ 		static auto im = imgui::get();
+ 		im->m_stats._drawcall_prim_incl_ignored.track_single();
+ 
+@@ -548,6 +576,12 @@ namespace comp
+ 			return dev->DrawIndexedPrimitive(PrimitiveType, BaseVertexIndex, MinVertexIndex, NumVertices, startIndex, primCount);
+ 		}
+ 
++		if (shared::common::config::get().raster_dlss.enabled)
++		{
++			prepare_raster_dlss_draw(dev);
++			return dev->DrawIndexedPrimitive(PrimitiveType, BaseVertexIndex, MinVertexIndex, NumVertices, startIndex, primCount);
++		}
++
+ 		auto& ctx = setup_context(dev);
+ 		static auto im = imgui::get();
+ 		auto& ffp = shared::common::ffp_state::get();
+diff --git a/FalloutNV-Remix-Wrapper/src/shared/common/config.cpp b/FalloutNV-Remix-Wrapper/src/shared/common/config.cpp
+index 207d27a..edba05e 100644
+--- a/FalloutNV-Remix-Wrapper/src/shared/common/config.cpp
++++ b/FalloutNV-Remix-Wrapper/src/shared/common/config.cpp
+@@ -49,6 +49,9 @@ namespace shared::common
+ 		remix.enabled = get_bool("Remix", "Enabled", true);
+ 		remix.dll_name = get_string("Remix", "DLLName", "d3d9_remix.dll");
+ 
++		// [RasterDLSS]
++		raster_dlss.enabled = get_bool("RasterDLSS", "Enabled", false);
++
+ 		// [Chain]
+ 		chain.preload = get_string("Chain", "Preload", "");
+ 		chain.postload = get_string("Chain", "Postload", "");
+@@ -99,7 +102,23 @@ namespace shared::common
+ 		sun_cycle.enabled = get_bool("SunCycle", "Enabled", true);
+ 		moon_cycle.enabled = get_bool("MoonCycle", "Enabled", true);
+ 
++		// Raster DLSS is deliberately a vanilla-rendering mode. Force every
++		// path-tracing compatibility mutation off even if an older INI still
++		// has those options enabled.
++		if (raster_dlss.enabled)
++		{
++			ffp.enabled = false;
++			skinning.enabled = false;
++			culling.enabled = false;
++			lights.enabled = false;
++			sun_cycle.enabled = false;
++			moon_cycle.enabled = false;
++		}
++
+ 		log("Config", std::format("Loaded from: {}", ini_path_));
++		if (raster_dlss.enabled)
++			log("Config", "RasterDLSS ENABLED: vanilla shader passthrough + camera metadata only",
++				LOG_TYPE::LOG_TYPE_GREEN);
+ 		log("Config", std::format("FFP={} AlbedoStage={} TerrainAlbedoStage={} BIAlbedoStage={} RouteLodToFfp={} RouteWaterToFfp={}",
+ 			ffp.enabled ? 1 : 0, ffp.albedo_stage, ffp.terrain_albedo_stage, ffp.bi_albedo_stage,
+ 			ffp.route_lod_to_ffp ? 1 : 0, ffp.route_water_to_ffp ? 1 : 0));
+diff --git a/FalloutNV-Remix-Wrapper/src/shared/common/config.hpp b/FalloutNV-Remix-Wrapper/src/shared/common/config.hpp
+index c85aacf..1887869 100644
+--- a/FalloutNV-Remix-Wrapper/src/shared/common/config.hpp
++++ b/FalloutNV-Remix-Wrapper/src/shared/common/config.hpp
+@@ -15,6 +15,14 @@ namespace shared::common
+ 		float get_float(const char* section, const char* key, float default_val) const;
+ 		bool get_bool(const char* section, const char* key, bool default_val) const;
+ 
++		struct raster_dlss_settings
++		{
++			// Preserve FNV's programmable raster pipeline and expose only the
++			// engine camera through fixed-function transform state. The Remix
++			// bridge can observe that state without changing shader output.
++			bool enabled = false;
++		} raster_dlss;
++
+ 		struct ffp_settings
+ 		{
+ 			bool enabled = true;

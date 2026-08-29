@@ -1,0 +1,162 @@
+diff --git a/FalloutNV-Remix-Wrapper/src/comp/d3d9_proxy.cpp b/FalloutNV-Remix-Wrapper/src/comp/d3d9_proxy.cpp
+index 275bf99..f5b61b0 100644
+--- a/FalloutNV-Remix-Wrapper/src/comp/d3d9_proxy.cpp
++++ b/FalloutNV-Remix-Wrapper/src/comp/d3d9_proxy.cpp
+@@ -6,6 +6,7 @@ namespace d3d9_proxy
+ {
+ 	static HMODULE chain_module_ = nullptr;
+ 	static std::vector<HMODULE> loaded_dlls_;
++	static bool passthrough_mode_ = false;
+ 
+ 	static PFN_Direct3DCreate9      pDirect3DCreate9 = nullptr;
+ 	static PFN_Direct3DCreate9Ex    pDirect3DCreate9Ex = nullptr;
+@@ -20,6 +21,31 @@ namespace d3d9_proxy
+ 	static FARPROC pDebugSetLevel = nullptr;
+ 	static FARPROC pDebugSetMute = nullptr;
+ 
++	bool is_target_process()
++	{
++		wchar_t executable_path[32768]{};
++		const auto path_length = GetModuleFileNameW(
++			nullptr,
++			executable_path,
++			static_cast<DWORD>(std::size(executable_path)));
++		if (!path_length || path_length >= std::size(executable_path))
++			return false;
++
++		const wchar_t* executable_name = executable_path;
++		for (const wchar_t* cursor = executable_path; *cursor; ++cursor)
++		{
++			if (*cursor == L'\\' || *cursor == L'/')
++				executable_name = cursor + 1;
++		}
++
++		return _wcsicmp(executable_name, L"FalloutNV.exe") == 0;
++	}
++
++	bool is_passthrough()
++	{
++		return passthrough_mode_;
++	}
++
+ 	static void configure_reshade_layer_for_bridge()
+ 	{
+ 		// Steam starts FalloutNV.exe from its already-running client, so temporary
+@@ -128,24 +154,28 @@ namespace d3d9_proxy
+ 
+ 	bool init()
+ 	{
+-		auto& cfg = shared::common::config::get();
++		passthrough_mode_ = !is_target_process();
+ 
+ 		// Try Remix bridge first (e.g. d3d9_remix.dll sitting next to us)
+-		if (cfg.remix.enabled && !cfg.remix.dll_name.empty())
++		if (!passthrough_mode_)
+ 		{
+-			configure_reshade_layer_for_bridge();
+-			chain_module_ = LoadLibraryA(cfg.remix.dll_name.c_str());
+-			if (chain_module_)
+-			{
+-				resolve_procs(chain_module_);
+-				shared::common::log("Proxy", std::format("Loaded Remix bridge: {}", cfg.remix.dll_name));
+-			}
+-			else
++			auto& cfg = shared::common::config::get();
++			if (cfg.remix.enabled && !cfg.remix.dll_name.empty())
+ 			{
+-				shared::common::log("Proxy",
+-					std::format("Remix enabled but could not load '{}' (error 0x{:X}). Falling back to system d3d9.",
+-						cfg.remix.dll_name, GetLastError()),
+-					shared::common::LOG_TYPE::LOG_TYPE_WARN);
++				configure_reshade_layer_for_bridge();
++				chain_module_ = LoadLibraryA(cfg.remix.dll_name.c_str());
++				if (chain_module_)
++				{
++					resolve_procs(chain_module_);
++					shared::common::log("Proxy", std::format("Loaded Remix bridge: {}", cfg.remix.dll_name));
++				}
++				else
++				{
++					shared::common::log("Proxy",
++						std::format("Remix enabled but could not load '{}' (error 0x{:X}). Falling back to system d3d9.",
++							cfg.remix.dll_name, GetLastError()),
++						shared::common::LOG_TYPE::LOG_TYPE_WARN);
++				}
+ 			}
+ 		}
+ 
+@@ -160,7 +190,20 @@ namespace d3d9_proxy
+ 			if (chain_module_)
+ 			{
+ 				resolve_procs(chain_module_);
+-				shared::common::log("Proxy", std::format("Loaded system d3d9: {}", sys_path));
++				if (passthrough_mode_)
++				{
++					shared::common::log(
++						"Proxy",
++						std::format(
++							"Non-game executable detected; loaded system d3d9 passthrough: {}",
++							sys_path));
++				}
++				else
++				{
++					shared::common::log(
++						"Proxy",
++						std::format("Loaded system d3d9: {}", sys_path));
++				}
+ 			}
+ 		}
+ 
+diff --git a/FalloutNV-Remix-Wrapper/src/comp/d3d9_proxy.hpp b/FalloutNV-Remix-Wrapper/src/comp/d3d9_proxy.hpp
+index f1c782c..dd5894c 100644
+--- a/FalloutNV-Remix-Wrapper/src/comp/d3d9_proxy.hpp
++++ b/FalloutNV-Remix-Wrapper/src/comp/d3d9_proxy.hpp
+@@ -16,6 +16,8 @@ namespace d3d9_proxy
+ 	// Load the real d3d9 chain (Remix bridge or system d3d9) and resolve exports.
+ 	// Must be called after config is loaded.
+ 	bool init();
++	bool is_target_process();
++	bool is_passthrough();
+ 
+ 	// Load DLL/ASI chains from config
+ 	void load_preload_dlls();
+diff --git a/FalloutNV-Remix-Wrapper/src/comp/main.cpp b/FalloutNV-Remix-Wrapper/src/comp/main.cpp
+index 7c5d2a3..404ce74 100644
+--- a/FalloutNV-Remix-Wrapper/src/comp/main.cpp
++++ b/FalloutNV-Remix-Wrapper/src/comp/main.cpp
+@@ -93,6 +93,15 @@ BOOL APIENTRY DllMain(HMODULE hmodule, const DWORD ul_reason_for_call, LPVOID)
+ 		shared::globals::setup_exe_module();
+ 		shared::globals::setup_homepath();
+ 
++		// The Bethesda settings launcher also loads d3d9.dll from the game
++		// directory. It is not FalloutNV.exe and must never receive the
++		// game-specific Remix bridge or fixed-address patches.
++		if (!d3d9_proxy::is_target_process())
++		{
++			d3d9_proxy::init();
++			return TRUE;
++		}
++
+ 		shared::common::set_console_color_blue(true);
+ 		std::cout << "Launching RTX Remix Comp - Fallout: New Vegas [" << COMP_MOD_VERSION_MAJOR << "." << COMP_MOD_VERSION_MINOR << "." << COMP_MOD_VERSION_PATCH << "]\n";
+ 		std::cout << "> Compiled On : " + std::string(__DATE__) + " " + std::string(__TIME__) + "\n";
+diff --git a/FalloutNV-Remix-Wrapper/src/comp/modules/d3d9ex.cpp b/FalloutNV-Remix-Wrapper/src/comp/modules/d3d9ex.cpp
+index ccdfbb8..5107499 100644
+--- a/FalloutNV-Remix-Wrapper/src/comp/modules/d3d9ex.cpp
++++ b/FalloutNV-Remix-Wrapper/src/comp/modules/d3d9ex.cpp
+@@ -1344,6 +1344,7 @@ extern "C" IDirect3D9* WINAPI Direct3DCreate9(UINT SDKVersion)
+ 	shared::common::log("d3d9", "Direct3DCreate9 called. Creating proxy interface.");
+ 	auto real_fn = d3d9_proxy::get_Direct3DCreate9();
+ 	if (!real_fn) return nullptr;
++	if (d3d9_proxy::is_passthrough()) return real_fn(SDKVersion);
+ 
+ 	IDirect3D9* real_d3d9 = real_fn(SDKVersion);
+ 	if (!real_d3d9) return nullptr;
+@@ -1357,6 +1358,7 @@ extern "C" HRESULT WINAPI Direct3DCreate9Ex(UINT SDKVersion, IDirect3D9Ex** ppD3
+ 	shared::common::log("d3d9", "Direct3DCreate9Ex called. Creating proxy interface.");
+ 	auto real_fn = d3d9_proxy::get_Direct3DCreate9Ex();
+ 	if (!real_fn || !ppD3D) return D3DERR_NOTAVAILABLE;
++	if (d3d9_proxy::is_passthrough()) return real_fn(SDKVersion, ppD3D);
+ 
+ 	IDirect3D9Ex* real_d3d9ex = nullptr;
+ 	HRESULT hr = real_fn(SDKVersion, &real_d3d9ex);

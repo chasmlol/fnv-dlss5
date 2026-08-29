@@ -1,0 +1,2990 @@
+diff --git a/DLSS5_NEURAL_RENDERING.md b/DLSS5_NEURAL_RENDERING.md
+new file mode 100644
+index 00000000..129acb71
+--- /dev/null
++++ b/DLSS5_NEURAL_RENDERING.md
+@@ -0,0 +1,51 @@
++# DLSS Neural Rendering
++
++This patch adds NVIDIA NGX feature 18 (DLSS Neural Rendering) to the
++Vulkan RTX Remix renderer.
++
++## Current mode
++
++- Runs after DLSS Super Resolution or DLSS Ray Reconstruction.
++- Uses the full-resolution linear HDR result as the NR color input.
++- Uses Remix depth and motion vectors as temporal guides.
++- Writes to a separate FP16 texture, then copies back only after a successful
++  NGX evaluation.
++- Preserves the original DLSS/RR result when feature creation or evaluation
++  fails.
++- Latches off after three consecutive evaluation failures.
++- Supports live tuning from the Remix menu without restarting the game.
++
++Feature 18 runs at a scaling ratio of 1.0 in this integration.
++It does not perform a second upscale.
++
++## Runtime
++
++Place NVIDIA's signed `nvngx_dlssnr.dll` next to the 64-bit Remix renderer in
++`.trex`. The API integration targets runtime version 310.8.0.0.
++
++## Options
++
++Options are stored under `rtx.neuralRendering`:
++
++- `enableNeuralRendering`
++- `neuralRenderingPreset`
++- `neuralRenderingStyle`
++- `neuralRenderingIntensity`
++- `neuralRenderingLocalToneStrength`
++- `neuralRenderingLocalStructureStrength`
++- `neuralRenderingSkinStructureStrength`
++- `neuralRenderingAutoMask`
++- `neuralRenderingUICorrection`
++- `neuralRenderingDepthMode`
++- `neuralRenderingMotionScaleX`
++- `neuralRenderingMotionScaleY`
++
++## Diagnostics
++
++Search the Remix renderer log for:
++
++- `Created DLSS Neural Rendering feature 18`
++- `DLSS Neural Rendering produced its first frame`
++- `DLSS Neural Rendering evaluation failed`
++
++The in-game Remix menu also reports successful and failed evaluation counts.
+diff --git a/src/d3d9/d3d9_rtx.cpp b/src/d3d9/d3d9_rtx.cpp
+index c7f94547..ed3ed3d1 100644
+--- a/src/d3d9/d3d9_rtx.cpp
++++ b/src/d3d9/d3d9_rtx.cpp
+@@ -14,6 +14,9 @@
+ #include "d3d9_rtx_utils.h"
+ #include "d3d9_texture.h"
+ #include "../dxvk/rtx_render/rtx_terrain_baker.h"
++// NV-DXVK start: Raster DLSS camera tracking
++#include "../dxvk/rtx_render/rtx_dlss.h"
++// NV-DXVK end
+ 
+ #include <cassert>
+ #include <cstring>
+@@ -568,11 +571,24 @@ namespace dxvk {
+   }
+ 
+   bool D3D9Rtx::isRenderingUI() {
+-    if (!m_parent->UseProgrammableVS() && orthographicIsUI()) {
++    const bool programmableRasterUiFallback =
++      DxvkDLSS::enableRasterDlss() &&
++      !RtxOptions::enableRaytracing() &&
++      m_rasterDlssCameraQueued &&
++      m_parent->UseProgrammableVS() &&
++      d3d9State().renderStates[D3DRS_ALPHABLENDENABLE] != FALSE;
++
++    if ((!m_parent->UseProgrammableVS() ||
++         programmableRasterUiFallback) &&
++        orthographicIsUI()) {
+       // Here we assume drawcalls with an orthographic projection are UI calls (as this pattern is common, and we can't raytrace these objects).
+       const bool isOrthographic = (d3d9State().transforms[GetTransformIndex(D3DTS_PROJECTION)][3][3] == 1.0f);
+       const bool zWriteEnabled = d3d9State().renderStates[D3DRS_ZWRITEENABLE];
+       if (isOrthographic && !zWriteEnabled) {
++        if (programmableRasterUiFallback) {
++          ONCE(Logger::info(
++            "Raster DLSS detected New Vegas programmable HUD rendering."));
++        }
+         return true;
+       }
+     }
+@@ -762,12 +778,41 @@ namespace dxvk {
+   }
+ 
+   void D3D9Rtx::triggerInjectRTX() {
++    Rc<DxvkImage> targetImage;
++
++    // The standard Remix UI boundary invokes RTX immediately before the
++    // first HUD draw. In vanilla-raster DLAA mode the scene color lives in
++    // the current D3D9 backbuffer, so carry that image into the early
++    // injection. This lets DLAA/Neural Rendering process the completed 3D
++    // scene first; the game's untouched HUD is then rasterized on top.
++    //
++    // Without this target, raster DLAA cannot run at the UI boundary and
++    // falls back to EndFrame/Present, after the HUD has already been drawn.
++    if (DxvkDLSS::enableRasterDlss() &&
++        !RtxOptions::enableRaytracing()) {
++      D3D9Surface* const renderTarget =
++        d3d9State().renderTargets[kRenderTargetIndex].ptr();
++      if (renderTarget != nullptr &&
++          renderTarget->GetCommonTexture() != nullptr) {
++        targetImage = renderTarget->GetCommonTexture()->GetImage();
++      }
++
++      m_parent->EmitCs([](DxvkContext* ctx) {
++        static_cast<RtxContext*>(ctx)->setRasterDlssSceneJitter(false);
++      });
++    }
++
+     // Flush any pending game and RTX work
+     m_parent->Flush();
+ 
+     // Send command to inject RTX
+-    m_parent->EmitCs([cReflexFrameId = GetReflexFrameId()](DxvkContext* ctx) {
+-      static_cast<RtxContext*>(ctx)->injectRTX(cReflexFrameId);
++    m_parent->EmitCs([
++      cReflexFrameId = GetReflexFrameId(),
++      targetImage = std::move(targetImage)
++    ](DxvkContext* ctx) {
++      static_cast<RtxContext*>(ctx)->injectRTX(
++        cReflexFrameId,
++        targetImage);
+     });
+   }
+ 
+@@ -1160,7 +1205,75 @@ namespace dxvk {
+     return true;
+   }
+ 
++  // NV-DXVK start: Raster DLSS camera tracking
++  void D3D9Rtx::trackRasterDlssCamera() {
++    if (!DxvkDLSS::enableRasterDlss() ||
++        RtxOptions::enableRaytracing() ||
++        m_rasterDlssCameraQueued ||
++        !m_activePresentParams.has_value() ||
++        d3d9State().renderTargets[kRenderTargetIndex] == nullptr ||
++        d3d9State().depthStencil == nullptr ||
++        d3d9State().renderStates[D3DRS_ZENABLE] != D3DZB_TRUE ||
++        d3d9State().viewport.MaxZ < 0.9f) {
++      return;
++    }
++
++    const auto* colorDesc =
++      d3d9State().renderTargets[kRenderTargetIndex]->GetCommonTexture()->Desc();
++    if (!isRenderTargetPrimary(*m_activePresentParams, colorDesc)) {
++      return;
++    }
++
++    Matrix4 worldToView =
++      d3d9State().transforms[GetTransformIndex(D3DTS_VIEW)];
++    Matrix4 viewToProjection =
++      d3d9State().transforms[GetTransformIndex(D3DTS_PROJECTION)];
++
++    // Reject fixed-function UI and other non-perspective draws. The first
++    // full-size perspective draw is the main scene camera for this frame.
++    if (isIdentityExact(viewToProjection) ||
++        viewToProjection[3][3] == 1.0f) {
++      return;
++    }
++
++    Rc<DxvkImageView> depthAttachment =
++      d3d9State().depthStencil->GetDepthStencilView();
++    m_rasterDlssCameraQueued = true;
++
++    m_parent->EmitCs([
++      worldToView,
++      viewToProjection,
++      depthAttachment
++    ](DxvkContext* ctx) {
++      static_cast<RtxContext*>(ctx)->processRasterDlssCamera(
++        worldToView,
++        viewToProjection,
++      depthAttachment);
++    });
++  }
++
++  void D3D9Rtx::tryTriggerRasterDlssInjection() {
++    if (!DxvkDLSS::enableRasterDlss() ||
++        RtxOptions::enableRaytracing() ||
++        !m_rasterDlssCameraQueued ||
++        m_rtxInjectTriggered ||
++        !isRenderingUI()) {
++      return;
++    }
++
++    ONCE(Logger::info(
++      "Raster DLSS found the New Vegas HUD boundary; processing the scene before UI."));
++    triggerInjectRTX();
++    m_rtxInjectTriggered = true;
++  }
++  // NV-DXVK end
++
+   PrepareDrawFlags D3D9Rtx::PrepareDrawGeometryForRT(const bool indexed, const DrawContext& context) {
++    // NV-DXVK start: Raster DLSS camera tracking
++    trackRasterDlssCamera();
++    tryTriggerRasterDlssInjection();
++    // NV-DXVK end
++
+     if (!RtxOptions::enableRaytracing() || !m_enableDrawCallConversion) {
+       return PrepareDrawFlag::PreserveDrawCallAndItsState;
+     }
+@@ -1210,6 +1323,11 @@ namespace dxvk {
+                                                        const uint32_t vertexSize,
+                                                        const uint32_t vertexStride,
+                                                        const DrawContext& drawContext) {
++    // NV-DXVK start: Raster DLSS camera tracking
++    trackRasterDlssCamera();
++    tryTriggerRasterDlssInjection();
++    // NV-DXVK end
++
+     if (!RtxOptions::enableRaytracing() || !m_enableDrawCallConversion) {
+       return PrepareDrawFlag::PreserveDrawCallAndItsState;
+     }
+@@ -1270,6 +1388,13 @@ namespace dxvk {
+ 
+   void D3D9Rtx::EndFrame(const Rc<DxvkImage>& targetImage, bool callInjectRtx) {
+     const auto currentReflexFrameId = GetReflexFrameId();
++
++    if (DxvkDLSS::enableRasterDlss() &&
++        !RtxOptions::enableRaytracing()) {
++      m_parent->EmitCs([](DxvkContext* ctx) {
++        static_cast<RtxContext*>(ctx)->setRasterDlssSceneJitter(false);
++      });
++    }
+     
+     // Flush any pending game and RTX work
+     m_parent->Flush();
+@@ -1281,6 +1406,9 @@ namespace dxvk {
+ 
+     // Reset for the next frame
+     m_rtxInjectTriggered = false;
++    // NV-DXVK start: Raster DLSS camera tracking
++    m_rasterDlssCameraQueued = false;
++    // NV-DXVK end
+     m_drawCallID = 0;
+     m_seenCameraPositionsPrev = std::move(m_seenCameraPositions);
+ 
+diff --git a/src/d3d9/d3d9_rtx.h b/src/d3d9/d3d9_rtx.h
+index 8e913469..03dd66ec 100644
+--- a/src/d3d9/d3d9_rtx.h
++++ b/src/d3d9/d3d9_rtx.h
+@@ -217,6 +217,9 @@ namespace dxvk {
+ 
+     const bool m_enableDrawCallConversion;
+     bool m_rtxInjectTriggered = false;
++    // NV-DXVK start: Raster DLSS camera tracking
++    bool m_rasterDlssCameraQueued = false;
++    // NV-DXVK end
+     bool m_forceGeometryCopy = false;
+     DWORD m_texcoordIndex = 0;
+ 
+@@ -265,6 +268,11 @@ namespace dxvk {
+ 
+     bool processRenderState();
+ 
++    // NV-DXVK start: Raster DLSS camera tracking
++    void trackRasterDlssCamera();
++    void tryTriggerRasterDlssInjection();
++    // NV-DXVK end
++
+     template<bool FixedFunction>
+     bool processTextures();
+ 
+diff --git a/src/dxvk/dxvk_image.h b/src/dxvk/dxvk_image.h
+index e4371a14..613740bc 100644
+--- a/src/dxvk/dxvk_image.h
++++ b/src/dxvk/dxvk_image.h
+@@ -389,6 +389,10 @@ namespace dxvk {
+      * \returns The shared handle with the type given by DxvkSharedHandleInfo::type
+      */
+     HANDLE sharedHandle() const;
++
++    bool isExternallyShared() const {
++      return m_shared;
++    }
+     
+   private:
+     
+diff --git a/src/dxvk/meson.build b/src/dxvk/meson.build
+index 50032f6c..1428a19e 100644
+--- a/src/dxvk/meson.build
++++ b/src/dxvk/meson.build
+@@ -215,6 +215,8 @@ dxvk_src = files([
+   'rtx_render/rtx_denoise_type.h',
+   'rtx_render/rtx_dlfg.cpp',
+   'rtx_render/rtx_dlfg.h',
++  'rtx_render/rtx_d3d12_dlaa.cpp',
++  'rtx_render/rtx_d3d12_dlaa.h',
+   'rtx_render/rtx_dlss.cpp', 
+   'rtx_render/rtx_dlss.h',
+   'rtx_render/rtx_draw_call_cache.cpp',
+diff --git a/src/dxvk/rtx_render/rtx_context.cpp b/src/dxvk/rtx_render/rtx_context.cpp
+index d7c637c3..6bb7fcaa 100644
+--- a/src/dxvk/rtx_render/rtx_context.cpp
++++ b/src/dxvk/rtx_render/rtx_context.cpp
+@@ -42,6 +42,7 @@
+ #include "rtx_restir_gi_rayquery.h"
+ #include "rtx_composite.h"
+ #include "rtx_debug_view.h"
++#include "rtx_dlss.h"
+ 
+ #include "rtx/pass/sparse_rendering/sparse_rendering.h"
+ 
+@@ -503,6 +504,8 @@ namespace dxvk {
+ 
+     auto common = getCommonObjects();
+     const auto isRaytracingEnabled = RtxOptions::enableRaytracing();
++    const bool isRasterDlssEnabled =
++      DxvkDLSS::enableRasterDlss() && !isRaytracingEnabled;
+     const auto asyncShaderCompilationActive = RtxOptions::Shader::enableAsyncCompilation() && common->pipelineManager().remixShaderCompilationCount() > 0;
+ 
+     // Whether a ray-traced scene is actually being rendered this frame.
+@@ -536,7 +539,11 @@ namespace dxvk {
+       return;
+     }
+ 
+-    if (m_frameLastInjected == m_device->getCurrentFrameId()) {
++    if ((!isRasterDlssEnabled &&
++         m_frameLastInjected == m_device->getCurrentFrameId()) ||
++        (isRasterDlssEnabled &&
++         m_rasterDlssFrameLastInjected ==
++           m_device->getCurrentFrameId())) {
+       return;
+     }
+ 
+@@ -585,6 +592,49 @@ namespace dxvk {
+ 
+     bool raytracedThisFrame = false;
+ 
++    if (isRasterDlssEnabled && targetImage != nullptr) {
++      m_rasterDlssFrameLastInjected =
++        m_device->getCurrentFrameId();
++
++      onInjectRtxFrameBegin(targetImage->info().extent);
++      Resources::RaytracingOutput& rtOutput =
++        getResourceManager().getRaytracingOutput();
++
++      bool rasterDlssSucceeded = false;
++      const bool hasCurrentDepth =
++        m_rasterDlssDepthAttachment != nullptr &&
++        m_rasterDlssDepthFrame == m_device->getCurrentFrameId();
++      if (isCameraValid &&
++          hasCurrentDepth &&
++          shouldUseDLSS() &&
++          common->metaDLSS().isActive()) {
++        rasterDlssSucceeded =
++          common->metaDLSS().dispatchRaster(
++            this,
++            m_execBarriers,
++            targetImage,
++            m_rasterDlssDepthAttachment,
++            m_resetHistory);
++      }
++
++      if (!rasterDlssSucceeded) {
++        const Resources::Resource& finalOutput =
++          rtOutput.m_finalOutput.resource(
++            Resources::AccessType::Write);
++        if (finalOutput.isValid()) {
++          blitImageHelper(
++            this,
++            targetImage,
++            finalOutput.image,
++            VK_FILTER_NEAREST);
++        }
++      }
++
++      // Keep the external bridge's presentation source coherent and avoid
++      // releasing/recreating the DLSS feature every frame.
++      m_previousUpscaler = m_currentUpscaler;
++    }
++
+     // Note: Only engage ray tracing when it is enabled, the camera is valid and when no shaders are currently being compiled asynchronously (as
+     // trying to render before shaders are done compiling will cause Remix to block).
+     if (isRaytracingEnabled && isCameraValid && !asyncShaderCompilationActive) {
+@@ -809,7 +859,8 @@ namespace dxvk {
+       // graph state to be reset - which is problematic since Logic graphs often trigger shader fetches.
+       // It might be safe to remove this clear entirely - it was added before we had any garbage collection
+       // in the scene manager, so it may not be needed anymore.
+-      if (!isRaytracingEnabled || !isCameraValid) {
++      if ((!isRaytracingEnabled && !isRasterDlssEnabled) ||
++          !isCameraValid) {
+         m_framesWithoutValidScene++;
+         // Some games may have invalid cameras for a brief period during camera cuts, but clearing the scene
+         // during these cuts causes all textures to need to be reloaded, which is slow.
+@@ -1015,6 +1066,111 @@ namespace dxvk {
+     }
+   }
+ 
++  void RtxContext::processRasterDlssCamera(
++    const Matrix4& worldToView,
++    const Matrix4& viewToProjection,
++    const Rc<DxvkImageView>& depthAttachment) {
++    if (!DxvkDLSS::enableRasterDlss() ||
++        RtxOptions::enableRaytracing() ||
++        depthAttachment == nullptr) {
++      return;
++    }
++
++    const uint32_t frameId = m_device->getCurrentFrameId();
++    RtCamera& camera =
++      getSceneManager().getCameraManager().getMainCamera();
++
++    // Raster DLAA evaluates the native D3D9 backbuffer, even when Remix's
++    // regular DLSS quality option has allocated lower-resolution ray-tracing
++    // resources. Jitter must therefore be converted with the native raster
++    // depth extent or the scene receives a larger clip-space offset than NGX
++    // is told to remove.
++    const VkExtent3D rasterExtent =
++      depthAttachment->image()->info().extent;
++    const uint32_t rasterResolution[2] = {
++      rasterExtent.width,
++      rasterExtent.height
++    };
++    camera.setResolution(
++      rasterResolution,
++      rasterResolution);
++
++    if (!camera.isValid(frameId)) {
++      getSceneManager().getCameraManager().processExternalCamera(
++        CameraType::Main,
++        worldToView,
++        viewToProjection);
++    }
++
++    m_rasterDlssDepthAttachment = depthAttachment;
++    m_rasterDlssDepthFrame = frameId;
++    setRasterDlssSceneJitter(true);
++    ONCE(Logger::info(
++      "Raster DLSS captured its first New Vegas camera/depth pair."));
++  }
++
++  void RtxContext::setRasterDlssSceneJitter(bool enable) {
++    if (!enable) {
++      if (m_rasterDlssSceneJitterEnabled) {
++        setSpecConstant(
++          VK_PIPELINE_BIND_POINT_GRAPHICS,
++          D3D9SpecConstantId::ClipSpaceJitterEnabled,
++          false);
++        m_rasterDlssSceneJitterEnabled = false;
++      }
++      return;
++    }
++
++    if (m_rtState.vertexCaptureCB == nullptr) {
++      ONCE(Logger::warn(
++        "Raster DLSS could not apply scene jitter because the D3D9 vertex constant buffer is unavailable."));
++      return;
++    }
++
++    RtCamera& camera =
++      getSceneManager().getCameraManager().getMainCamera();
++    const uint32_t frameId = m_device->getCurrentFrameId();
++    if (!camera.isValid(frameId)) {
++      return;
++    }
++
++    float pixelJitter[2] = {};
++    camera.getJittering(pixelJitter);
++
++    const Matrix4d& viewToProjection =
++      camera.getViewToProjection();
++    const float ratioX = Sign(viewToProjection[2][3]);
++    const float ratioY = -Sign(viewToProjection[2][3]);
++    const Vector2 clipSpaceJitter = camera.calcClipSpaceJitter(
++      Vector2(pixelJitter[0], pixelJitter[1]),
++      ratioX,
++      ratioY);
++
++    D3D9RtxVertexCaptureData modified =
++      *static_cast<D3D9RtxVertexCaptureData*>(
++        m_rtState.vertexCaptureCB->mapPtr(0));
++    modified.jitterX = clipSpaceJitter.x;
++    modified.jitterY = clipSpaceJitter.y;
++    allocAndMapVertexCaptureConstantBuffer() = modified;
++
++    setSpecConstant(
++      VK_PIPELINE_BIND_POINT_GRAPHICS,
++      D3D9SpecConstantId::ClipSpaceJitterEnabled,
++      true);
++    m_rasterDlssSceneJitterEnabled = true;
++
++    ONCE(Logger::info(str::format(
++      "Raster DLSS applied sub-pixel jitter to the New Vegas scene: pixel=(",
++      pixelJitter[0],
++      ", ",
++      pixelJitter[1],
++      "), clip=(",
++      clipSpaceJitter.x,
++      ", ",
++      clipSpaceJitter.y,
++      ").")));
++  }
++
+   void RtxContext::commitExternalGeometryToRT(std::unique_ptr<ExternalDrawState> state) {
+     getSceneManager().submitExternalDraw(this, std::move(state));
+   }
+diff --git a/src/dxvk/rtx_render/rtx_context.h b/src/dxvk/rtx_render/rtx_context.h
+index 2804e619..18ac74cc 100644
+--- a/src/dxvk/rtx_render/rtx_context.h
++++ b/src/dxvk/rtx_render/rtx_context.h
+@@ -112,6 +112,11 @@ namespace dxvk {
+ 
+     void commitGeometryToRT(const DrawParameters& params, DrawCallState& drawCallState);
+     void commitExternalGeometryToRT(std::unique_ptr<ExternalDrawState> state);
++    void processRasterDlssCamera(
++      const Matrix4& worldToView,
++      const Matrix4& viewToProjection,
++      const Rc<DxvkImageView>& depthAttachment);
++    void setRasterDlssSceneJitter(bool enable);
+ 
+     static void blitImageHelper(Rc<DxvkContext> ctx, const Rc<DxvkImage>& srcImage, const Rc<DxvkImage>& dstImage, VkFilter filter);
+ 
+@@ -226,6 +231,10 @@ namespace dxvk {
+     InternalUpscaler m_previousUpscaler = InternalUpscaler::None;
+ 
+     uint32_t m_frameLastInjected = kInvalidFrameIndex;
++    uint32_t m_rasterDlssFrameLastInjected = kInvalidFrameIndex;
++    uint32_t m_rasterDlssDepthFrame = kInvalidFrameIndex;
++    Rc<DxvkImageView> m_rasterDlssDepthAttachment;
++    bool m_rasterDlssSceneJitterEnabled = false;
+     bool m_captureStateForRTX = true;
+ 
+     Rc<DxvkImage> m_skyProbeImage;
+diff --git a/src/dxvk/rtx_render/rtx_d3d12_dlaa.cpp b/src/dxvk/rtx_render/rtx_d3d12_dlaa.cpp
+new file mode 100644
+index 00000000..6cc258ce
+--- /dev/null
++++ b/src/dxvk/rtx_render/rtx_d3d12_dlaa.cpp
+@@ -0,0 +1,966 @@
++/*
++ * Copyright (c) 2026
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a
++ * copy of this software and associated documentation files (the "Software"),
++ * to deal in the Software without restriction, including without limitation
++ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
++ * and/or sell copies of the Software, and to permit persons to whom the
++ * Software is furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in
++ * all copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
++ * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
++ * DEALINGS IN THE SOFTWARE.
++ */
++
++#include <array>
++#include <filesystem>
++
++#include <d3d12.h>
++#include <dxgi1_6.h>
++#include <wrl/client.h>
++
++#include "dxvk_context.h"
++#include "dxvk_device.h"
++#include "rtx_d3d12_dlaa.h"
++#include "rtx_options.h"
++
++#include <nvsdk_ngx_helpers.h>
++
++namespace dxvk {
++  namespace {
++    using Microsoft::WRL::ComPtr;
++
++    struct SharedTexture {
++      ComPtr<ID3D12Resource> d3d12;
++      HANDLE handle = INVALID_HANDLE_VALUE;
++      Resources::Resource vulkan;
++
++      void reset() {
++        // The Vulkan import must be destroyed before its D3D12 allocation.
++        vulkan.reset();
++
++        if (handle != INVALID_HANDLE_VALUE) {
++          CloseHandle(handle);
++          handle = INVALID_HANDLE_VALUE;
++        }
++
++        d3d12.Reset();
++      }
++    };
++
++    std::filesystem::path executableDirectory() {
++      std::array<wchar_t, 32768> path = {};
++      const DWORD length = GetModuleFileNameW(
++        nullptr,
++        path.data(),
++        static_cast<DWORD>(path.size()));
++      if (length == 0 || length >= path.size()) {
++        return std::filesystem::current_path();
++      }
++
++      return std::filesystem::path(
++        std::wstring_view(path.data(), length)).parent_path();
++    }
++
++    bool sameLuid(const LUID& lhs, const uint8_t* rhs) {
++      return std::memcmp(&lhs, rhs, sizeof(LUID)) == 0;
++    }
++
++    D3D12_RESOURCE_BARRIER transition(
++      ID3D12Resource* resource,
++      D3D12_RESOURCE_STATES before,
++      D3D12_RESOURCE_STATES after) {
++      D3D12_RESOURCE_BARRIER barrier = {};
++      barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
++      barrier.Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE;
++      barrier.Transition.pResource = resource;
++      barrier.Transition.Subresource =
++        D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
++      barrier.Transition.StateBefore = before;
++      barrier.Transition.StateAfter = after;
++      return barrier;
++    }
++  }
++
++  struct D3D12DlaaInterop::Impl {
++    explicit Impl(DxvkDevice* device)
++    : device(device) {
++    }
++
++    ~Impl() {
++      release();
++    }
++
++    bool initializeHost() {
++      if (initialized) {
++        return true;
++      }
++
++      if (d3d12Module ||
++          dxgiModule ||
++          d3d12Device ||
++          ngxInitialized) {
++        release();
++      }
++
++      statusText = "creating matching D3D12 device";
++
++      d3d12Module = LoadLibraryExW(
++        L"d3d12.dll",
++        nullptr,
++        LOAD_LIBRARY_SEARCH_SYSTEM32);
++      dxgiModule = LoadLibraryExW(
++        L"dxgi.dll",
++        nullptr,
++        LOAD_LIBRARY_SEARCH_SYSTEM32);
++      if (!d3d12Module || !dxgiModule) {
++        statusText = "failed to load D3D12/DXGI";
++        Logger::err("D3D12 DLAA host: failed to load D3D12 or DXGI.");
++        return false;
++      }
++
++      const auto createDevice =
++        reinterpret_cast<PFN_D3D12_CREATE_DEVICE>(
++          GetProcAddress(d3d12Module, "D3D12CreateDevice"));
++      using CreateFactoryFn = HRESULT (WINAPI*)(REFIID, void**);
++      const auto createFactory =
++        reinterpret_cast<CreateFactoryFn>(
++          GetProcAddress(dxgiModule, "CreateDXGIFactory1"));
++      if (!createDevice || !createFactory) {
++        statusText = "missing D3D12/DXGI entry point";
++        Logger::err(
++          "D3D12 DLAA host: D3D12CreateDevice/CreateDXGIFactory1 is unavailable.");
++        return false;
++      }
++
++      ComPtr<IDXGIFactory4> factory;
++      HRESULT hr = createFactory(IID_PPV_ARGS(&factory));
++      if (FAILED(hr)) {
++        statusText = "failed to create DXGI factory";
++        Logger::err(str::format(
++          "D3D12 DLAA host: CreateDXGIFactory1 failed: 0x",
++          std::hex,
++          static_cast<uint32_t>(hr)));
++        return false;
++      }
++
++      const VkPhysicalDeviceIDProperties& id =
++        device->adapter()->devicePropertiesExt().coreDeviceId;
++      if (!id.deviceLUIDValid) {
++        statusText = "Vulkan adapter has no valid LUID";
++        Logger::err(
++          "D3D12 DLAA host: Vulkan adapter did not expose a valid device LUID.");
++        return false;
++      }
++
++      for (uint32_t index = 0; ; index++) {
++        ComPtr<IDXGIAdapter1> candidate;
++        if (factory->EnumAdapters1(index, &candidate) == DXGI_ERROR_NOT_FOUND) {
++          break;
++        }
++
++        DXGI_ADAPTER_DESC1 desc = {};
++        if (FAILED(candidate->GetDesc1(&desc)) ||
++            !sameLuid(desc.AdapterLuid, id.deviceLUID)) {
++          continue;
++        }
++
++        hr = createDevice(
++          candidate.Get(),
++          D3D_FEATURE_LEVEL_11_0,
++          IID_PPV_ARGS(&d3d12Device));
++        if (SUCCEEDED(hr)) {
++          adapter = candidate;
++          break;
++        }
++      }
++
++      if (!d3d12Device) {
++        statusText = "failed to match Vulkan GPU in D3D12";
++        Logger::err(
++          "D3D12 DLAA host: no D3D12 adapter matched the Vulkan device LUID.");
++        return false;
++      }
++
++      D3D12_COMMAND_QUEUE_DESC queueDesc = {};
++      queueDesc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
++      queueDesc.Priority = D3D12_COMMAND_QUEUE_PRIORITY_NORMAL;
++      queueDesc.Flags = D3D12_COMMAND_QUEUE_FLAG_NONE;
++      queueDesc.NodeMask = 0;
++
++      hr = d3d12Device->CreateCommandQueue(
++        &queueDesc,
++        IID_PPV_ARGS(&queue));
++      if (FAILED(hr)) {
++        statusText = "failed to create D3D12 queue";
++        return false;
++      }
++
++      hr = d3d12Device->CreateCommandAllocator(
++        D3D12_COMMAND_LIST_TYPE_DIRECT,
++        IID_PPV_ARGS(&allocator));
++      if (FAILED(hr)) {
++        statusText = "failed to create D3D12 allocator";
++        return false;
++      }
++
++      hr = d3d12Device->CreateCommandList(
++        0,
++        D3D12_COMMAND_LIST_TYPE_DIRECT,
++        allocator.Get(),
++        nullptr,
++        IID_PPV_ARGS(&commandList));
++      if (FAILED(hr)) {
++        statusText = "failed to create D3D12 command list";
++        return false;
++      }
++      commandList->Close();
++
++      hr = d3d12Device->CreateFence(
++        0,
++        D3D12_FENCE_FLAG_NONE,
++        IID_PPV_ARGS(&fence));
++      if (FAILED(hr)) {
++        statusText = "failed to create D3D12 fence";
++        return false;
++      }
++
++      fenceEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
++      if (!fenceEvent) {
++        statusText = "failed to create D3D12 fence event";
++        return false;
++      }
++
++      if (!createInteropFence()) {
++        return false;
++      }
++
++      const std::filesystem::path appDirectory =
++        executableDirectory();
++      const NVSDK_NGX_Result ngxResult = NVSDK_NGX_D3D12_Init(
++        RtxOptions::applicationId(),
++        appDirectory.c_str(),
++        d3d12Device.Get(),
++        nullptr,
++        NVSDK_NGX_Version_API);
++      if (NVSDK_NGX_FAILED(ngxResult)) {
++        statusText = "NGX D3D12 initialization failed";
++        Logger::err(str::format(
++          "D3D12 DLAA host: NVSDK_NGX_D3D12_Init failed: 0x",
++          std::hex,
++          static_cast<uint32_t>(ngxResult)));
++        return false;
++      }
++      ngxInitialized = true;
++
++      const NVSDK_NGX_Result paramsResult =
++        NVSDK_NGX_D3D12_GetCapabilityParameters(&parameters);
++      if (NVSDK_NGX_FAILED(paramsResult) || !parameters) {
++        statusText = "NGX capability parameters unavailable";
++        Logger::err(str::format(
++          "D3D12 DLAA host: GetCapabilityParameters failed: 0x",
++          std::hex,
++          static_cast<uint32_t>(paramsResult)));
++        return false;
++      }
++
++      initialized = true;
++      statusText = "ready; waiting for shared DLAA resources";
++      Logger::info(
++        "D3D12 DLAA host: initialized on the Vulkan adapter LUID.");
++      return true;
++    }
++
++    bool createInteropFence() {
++      if (!device->extensions().khrExternalSemaphore ||
++          !device->extensions().khrExternalSemaphoreWin32 ||
++          !device->vkd()->vkGetSemaphoreWin32HandleKHR) {
++        statusText = "Vulkan external D3D12 fences unavailable";
++        Logger::err(
++          "D3D12 DLAA host: Vulkan external-semaphore support is unavailable.");
++        return false;
++      }
++
++      VkExportSemaphoreCreateInfo exportInfo = {};
++      exportInfo.sType =
++        VK_STRUCTURE_TYPE_EXPORT_SEMAPHORE_CREATE_INFO;
++      exportInfo.pNext = nullptr;
++      exportInfo.handleTypes =
++        VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_D3D12_FENCE_BIT;
++
++      VkSemaphoreTypeCreateInfo timelineInfo = {};
++      timelineInfo.sType =
++        VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO;
++      timelineInfo.pNext = &exportInfo;
++      timelineInfo.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
++      timelineInfo.initialValue = 0;
++
++      VkSemaphoreCreateInfo createInfo = {};
++      createInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
++      createInfo.pNext = &timelineInfo;
++
++      const VkResult createResult =
++        device->vkd()->vkCreateSemaphore(
++          device->handle(),
++          &createInfo,
++          nullptr,
++          &interopSemaphore);
++      if (createResult != VK_SUCCESS) {
++        statusText = "failed to create Vulkan interop fence";
++        Logger::err(str::format(
++          "D3D12 DLAA host: Vulkan timeline semaphore creation failed: ",
++          createResult));
++        return false;
++      }
++
++      VkSemaphoreGetWin32HandleInfoKHR handleInfo = {};
++      handleInfo.sType =
++        VK_STRUCTURE_TYPE_SEMAPHORE_GET_WIN32_HANDLE_INFO_KHR;
++      handleInfo.semaphore = interopSemaphore;
++      handleInfo.handleType =
++        VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_D3D12_FENCE_BIT;
++
++      HANDLE sharedHandle = INVALID_HANDLE_VALUE;
++      const VkResult exportResult =
++        device->vkd()->vkGetSemaphoreWin32HandleKHR(
++          device->handle(),
++          &handleInfo,
++          &sharedHandle);
++      if (exportResult != VK_SUCCESS ||
++          sharedHandle == INVALID_HANDLE_VALUE) {
++        statusText = "failed to export Vulkan interop fence";
++        Logger::err(str::format(
++          "D3D12 DLAA host: Vulkan fence export failed: ",
++          exportResult));
++        return false;
++      }
++
++      const HRESULT openResult =
++        d3d12Device->OpenSharedHandle(
++          sharedHandle,
++          IID_PPV_ARGS(&interopFence));
++      CloseHandle(sharedHandle);
++      if (FAILED(openResult)) {
++        statusText = "D3D12 rejected Vulkan interop fence";
++        Logger::err(str::format(
++          "D3D12 DLAA host: OpenSharedHandle for the Vulkan fence failed: 0x",
++          std::hex,
++          static_cast<uint32_t>(openResult)));
++        return false;
++      }
++
++      return true;
++    }
++
++    bool resetCommandList() {
++      if (FAILED(allocator->Reset())) {
++        statusText = "D3D12 command allocator reset failed";
++        return false;
++      }
++      if (FAILED(commandList->Reset(allocator.Get(), nullptr))) {
++        statusText = "D3D12 command-list reset failed";
++        return false;
++      }
++      return true;
++    }
++
++    bool executeAndWait(uint64_t releaseToVulkanValue = 0) {
++      if (FAILED(commandList->Close())) {
++        statusText = "D3D12 command-list close failed";
++        return false;
++      }
++
++      ID3D12CommandList* lists[] = { commandList.Get() };
++      queue->ExecuteCommandLists(1, lists);
++
++      if (releaseToVulkanValue != 0 &&
++          FAILED(queue->Signal(
++            interopFence.Get(),
++            releaseToVulkanValue))) {
++        statusText = "D3D12 interop-fence signal failed";
++        return false;
++      }
++
++      const uint64_t value = ++fenceValue;
++      if (FAILED(queue->Signal(fence.Get(), value))) {
++        statusText = "D3D12 queue signal failed";
++        return false;
++      }
++
++      if (fence->GetCompletedValue() < value) {
++        if (FAILED(fence->SetEventOnCompletion(value, fenceEvent))) {
++          statusText = "D3D12 fence wait setup failed";
++          return false;
++        }
++        WaitForSingleObject(fenceEvent, INFINITE);
++      }
++
++      return true;
++    }
++
++    bool createD3D12Texture(
++      SharedTexture& texture,
++      const VkExtent3D& extent,
++      DXGI_FORMAT format,
++      const wchar_t* name) {
++      D3D12_HEAP_PROPERTIES heap = {};
++      heap.Type = D3D12_HEAP_TYPE_DEFAULT;
++      heap.CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_UNKNOWN;
++      heap.MemoryPoolPreference = D3D12_MEMORY_POOL_UNKNOWN;
++      heap.CreationNodeMask = 1;
++      heap.VisibleNodeMask = 1;
++
++      D3D12_RESOURCE_DESC desc = {};
++      desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
++      desc.Alignment = 0;
++      desc.Width = extent.width;
++      desc.Height = extent.height;
++      desc.DepthOrArraySize = 1;
++      desc.MipLevels = 1;
++      desc.Format = format;
++      desc.SampleDesc.Count = 1;
++      desc.SampleDesc.Quality = 0;
++      desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
++      desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
++
++      const HRESULT createResult =
++        d3d12Device->CreateCommittedResource(
++          &heap,
++          D3D12_HEAP_FLAG_SHARED,
++          &desc,
++          D3D12_RESOURCE_STATE_COMMON,
++          nullptr,
++          IID_PPV_ARGS(&texture.d3d12));
++      if (FAILED(createResult)) {
++        statusText = "failed to create shared D3D12 texture";
++        Logger::err(str::format(
++          "D3D12 DLAA host: CreateCommittedResource failed: 0x",
++          std::hex,
++          static_cast<uint32_t>(createResult)));
++        return false;
++      }
++
++      texture.d3d12->SetName(name);
++      const HRESULT shareResult = d3d12Device->CreateSharedHandle(
++        texture.d3d12.Get(),
++        nullptr,
++        GENERIC_ALL,
++        nullptr,
++        &texture.handle);
++      if (FAILED(shareResult)) {
++        statusText = "failed to export D3D12 texture";
++        Logger::err(str::format(
++          "D3D12 DLAA host: CreateSharedHandle failed: 0x",
++          std::hex,
++          static_cast<uint32_t>(shareResult)));
++        return false;
++      }
++
++      return true;
++    }
++
++    bool importIntoVulkan(
++      Rc<DxvkContext> ctx,
++      SharedTexture& texture,
++      const VkExtent3D& extent,
++      VkFormat format,
++      const char* name) {
++      DxvkImageCreateInfo imageInfo = {};
++      imageInfo.type = VK_IMAGE_TYPE_2D;
++      imageInfo.format = format;
++      imageInfo.flags = 0;
++      imageInfo.sampleCount = VK_SAMPLE_COUNT_1_BIT;
++      imageInfo.extent = extent;
++      imageInfo.numLayers = 1;
++      imageInfo.mipLevels = 1;
++      imageInfo.usage =
++        VK_IMAGE_USAGE_SAMPLED_BIT |
++        VK_IMAGE_USAGE_STORAGE_BIT |
++        VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
++        VK_IMAGE_USAGE_TRANSFER_DST_BIT;
++      imageInfo.stages =
++        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
++        VK_PIPELINE_STAGE_TRANSFER_BIT;
++      imageInfo.access =
++        VK_ACCESS_SHADER_READ_BIT |
++        VK_ACCESS_SHADER_WRITE_BIT |
++        VK_ACCESS_TRANSFER_READ_BIT |
++        VK_ACCESS_TRANSFER_WRITE_BIT;
++      imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
++      imageInfo.layout = VK_IMAGE_LAYOUT_GENERAL;
++      imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
++      imageInfo.shared = VK_TRUE;
++      imageInfo.sharing.mode = DxvkSharedHandleMode::Import;
++      imageInfo.sharing.type =
++        VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_RESOURCE_BIT;
++      imageInfo.sharing.handle = texture.handle;
++
++      texture.vulkan.image = device->createImage(
++        imageInfo,
++        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
++        DxvkMemoryStats::Category::RTXRenderTarget,
++        name);
++      if (!texture.vulkan.image->isExternallyShared()) {
++        texture.vulkan.reset();
++        statusText = "Vulkan rejected D3D12 shared texture";
++        Logger::err(str::format(
++          "D3D12 DLAA host: external-memory import was rejected for ",
++          name,
++          "."));
++        return false;
++      }
++
++      DxvkImageViewCreateInfo viewInfo = {};
++      viewInfo.type = VK_IMAGE_VIEW_TYPE_2D;
++      viewInfo.format = format;
++      viewInfo.usage = imageInfo.usage;
++      viewInfo.aspect = VK_IMAGE_ASPECT_COLOR_BIT;
++      viewInfo.minLevel = 0;
++      viewInfo.numLevels = 1;
++      viewInfo.minLayer = 0;
++      viewInfo.numLayers = 1;
++      texture.vulkan.view =
++        device->createImageView(texture.vulkan.image, viewInfo);
++
++      ctx->changeImageLayout(
++        texture.vulkan.image,
++        VK_IMAGE_LAYOUT_GENERAL);
++      return true;
++    }
++
++    bool createSharedTexture(
++      Rc<DxvkContext> ctx,
++      SharedTexture& texture,
++      const VkExtent3D& extent,
++      DXGI_FORMAT dxgiFormat,
++      VkFormat vkFormat,
++      const wchar_t* d3dName,
++      const char* vkName) {
++      return createD3D12Texture(
++          texture,
++          extent,
++          dxgiFormat,
++          d3dName) &&
++        importIntoVulkan(
++          ctx,
++          texture,
++          extent,
++          vkFormat,
++          vkName);
++    }
++
++    bool createFeature() {
++      if (!resetCommandList()) {
++        return false;
++      }
++
++      parameters->Set(
++        NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_DLAA,
++        static_cast<int>(NVSDK_NGX_DLSS_Hint_Render_Preset_M));
++      parameters->Set(
++        NVSDK_NGX_Parameter_FreeMemOnReleaseFeature,
++        1);
++
++      NVSDK_NGX_DLSS_Create_Params createParams = {};
++      createParams.Feature.InWidth = extent.width;
++      createParams.Feature.InHeight = extent.height;
++      createParams.Feature.InTargetWidth = extent.width;
++      createParams.Feature.InTargetHeight = extent.height;
++      createParams.Feature.InPerfQualityValue =
++        NVSDK_NGX_PerfQuality_Value_DLAA;
++      createParams.InFeatureCreateFlags =
++        NVSDK_NGX_DLSS_Feature_Flags_MVLowRes |
++        NVSDK_NGX_DLSS_Feature_Flags_AutoExposure;
++      createParams.InEnableOutputSubrects = false;
++
++      const NVSDK_NGX_Result result = NGX_D3D12_CREATE_DLSS_EXT(
++        commandList.Get(),
++        1,
++        1,
++        &feature,
++        parameters,
++        &createParams);
++      if (NVSDK_NGX_FAILED(result) || !feature) {
++        commandList->Close();
++        statusText = "D3D12 NGX DLAA feature creation failed";
++        Logger::err(str::format(
++          "D3D12 DLAA host: NGX feature creation failed: 0x",
++          std::hex,
++          static_cast<uint32_t>(result)));
++        return false;
++      }
++
++      if (!executeAndWait()) {
++        return false;
++      }
++
++      statusText = "D3D12 DLAA ready; ReShade add-on may attach";
++      Logger::info(str::format(
++        "D3D12 DLAA host: created native-resolution DLAA feature at ",
++        extent.width,
++        "x",
++        extent.height,
++        "."));
++      return true;
++    }
++
++    void releaseFeature() {
++      if (feature) {
++        NVSDK_NGX_D3D12_ReleaseFeature(feature);
++        feature = nullptr;
++      }
++    }
++
++    void releaseSharedTextures() {
++      color.reset();
++      depth.reset();
++      motion.reset();
++      output.reset();
++      extent = {};
++    }
++
++    bool ensureResources(
++      Rc<DxvkContext> ctx,
++      const VkExtent3D& requestedExtent) {
++      if (!initializeHost()) {
++        return false;
++      }
++
++      if (feature &&
++          extent.width == requestedExtent.width &&
++          extent.height == requestedExtent.height &&
++          color.vulkan.isValid() &&
++          depth.vulkan.isValid() &&
++          motion.vulkan.isValid() &&
++          output.vulkan.isValid()) {
++        return true;
++      }
++
++      // Make sure neither API can still reference allocations being replaced.
++      ctx->flushCommandList();
++      device->waitForIdle();
++      waitForD3D12Idle();
++
++      releaseFeature();
++      releaseSharedTextures();
++      extent = requestedExtent;
++
++      const bool resourcesCreated =
++        createSharedTexture(
++          ctx,
++          color,
++          extent,
++          DXGI_FORMAT_R16G16B16A16_FLOAT,
++          VK_FORMAT_R16G16B16A16_SFLOAT,
++          L"FNV DLAA Color",
++          "FNV DLAA shared color") &&
++        createSharedTexture(
++          ctx,
++          depth,
++          extent,
++          DXGI_FORMAT_R32_FLOAT,
++          VK_FORMAT_R32_SFLOAT,
++          L"FNV DLAA Depth",
++          "FNV DLAA shared depth") &&
++        createSharedTexture(
++          ctx,
++          motion,
++          extent,
++          DXGI_FORMAT_R16G16_FLOAT,
++          VK_FORMAT_R16G16_SFLOAT,
++          L"FNV DLAA Motion",
++          "FNV DLAA shared motion") &&
++        createSharedTexture(
++          ctx,
++          output,
++          extent,
++          DXGI_FORMAT_R16G16B16A16_FLOAT,
++          VK_FORMAT_R16G16B16A16_SFLOAT,
++          L"FNV DLAA Output",
++          "FNV DLAA shared output");
++      if (!resourcesCreated) {
++        releaseSharedTextures();
++        return false;
++      }
++
++      if (!createFeature()) {
++        releaseSharedTextures();
++        return false;
++      }
++
++      return true;
++    }
++
++    bool evaluate(
++      Rc<DxvkContext> ctx,
++      bool resetHistory,
++      float jitterX,
++      float jitterY) {
++      if (!interopSemaphore || !interopFence) {
++        statusText = "cross-API synchronization unavailable";
++        return false;
++      }
++
++      const uint64_t readyForD3D12Value = ++interopFenceValue;
++      ctx->getCommandList()->addSignalSemaphore(
++        interopSemaphore,
++        readyForD3D12Value);
++      ctx->flushCommandList();
++
++      if (FAILED(queue->Wait(
++            interopFence.Get(),
++            readyForD3D12Value))) {
++        statusText = "D3D12 interop-fence wait failed";
++        return false;
++      }
++
++      if (!feature || !resetCommandList()) {
++        return false;
++      }
++
++      std::array<D3D12_RESOURCE_BARRIER, 4> acquire = {
++        transition(
++          color.d3d12.Get(),
++          D3D12_RESOURCE_STATE_COMMON,
++          D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
++        transition(
++          depth.d3d12.Get(),
++          D3D12_RESOURCE_STATE_COMMON,
++          D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
++        transition(
++          motion.d3d12.Get(),
++          D3D12_RESOURCE_STATE_COMMON,
++          D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
++        transition(
++          output.d3d12.Get(),
++          D3D12_RESOURCE_STATE_COMMON,
++          D3D12_RESOURCE_STATE_UNORDERED_ACCESS)
++      };
++      commandList->ResourceBarrier(
++        static_cast<UINT>(acquire.size()),
++        acquire.data());
++
++      NVSDK_NGX_D3D12_DLSS_Eval_Params eval = {};
++      eval.Feature.pInColor = color.d3d12.Get();
++      eval.Feature.pInOutput = output.d3d12.Get();
++      eval.Feature.InSharpness = 0.0f;
++      eval.pInDepth = depth.d3d12.Get();
++      eval.pInMotionVectors = motion.d3d12.Get();
++      eval.InJitterOffsetX = jitterX;
++      eval.InJitterOffsetY = jitterY;
++      eval.InRenderSubrectDimensions.Width = extent.width;
++      eval.InRenderSubrectDimensions.Height = extent.height;
++      eval.InReset = resetHistory ? 1 : 0;
++      eval.InMVScaleX = 1.0f;
++      eval.InMVScaleY = 1.0f;
++      eval.InPreExposure = 1.0f;
++      eval.InExposureScale = 1.0f;
++
++      const NVSDK_NGX_Result ngxResult =
++        NGX_D3D12_EVALUATE_DLSS_EXT(
++          commandList.Get(),
++          feature,
++          parameters,
++          &eval);
++
++      std::array<D3D12_RESOURCE_BARRIER, 4> releaseBarriers = {
++        transition(
++          color.d3d12.Get(),
++          D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
++          D3D12_RESOURCE_STATE_COMMON),
++        transition(
++          depth.d3d12.Get(),
++          D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
++          D3D12_RESOURCE_STATE_COMMON),
++        transition(
++          motion.d3d12.Get(),
++          D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
++          D3D12_RESOURCE_STATE_COMMON),
++        transition(
++          output.d3d12.Get(),
++          D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
++          D3D12_RESOURCE_STATE_COMMON)
++      };
++      commandList->ResourceBarrier(
++        static_cast<UINT>(releaseBarriers.size()),
++        releaseBarriers.data());
++
++      if (NVSDK_NGX_FAILED(ngxResult)) {
++        commandList->Close();
++        statusText = "D3D12 NGX DLAA evaluation failed";
++        Logger::warn(str::format(
++          "D3D12 DLAA host: NGX evaluation failed: 0x",
++          std::hex,
++          static_cast<uint32_t>(ngxResult)));
++        return false;
++      }
++
++      const uint64_t readyForVulkanValue = ++interopFenceValue;
++      if (!executeAndWait(readyForVulkanValue)) {
++        return false;
++      }
++
++      ctx->getCommandList()->addWaitSemaphore(
++        interopSemaphore,
++        readyForVulkanValue);
++
++      statusText = "D3D12 DLAA evaluations active";
++      return true;
++    }
++
++    void waitForD3D12Idle() {
++      if (!queue || !fence || !fenceEvent) {
++        return;
++      }
++
++      const uint64_t value = ++fenceValue;
++      if (FAILED(queue->Signal(fence.Get(), value))) {
++        return;
++      }
++
++      if (fence->GetCompletedValue() < value &&
++          SUCCEEDED(fence->SetEventOnCompletion(value, fenceEvent))) {
++        WaitForSingleObject(fenceEvent, INFINITE);
++      }
++    }
++
++    void release() {
++      if (device) {
++        device->waitForIdle();
++      }
++      waitForD3D12Idle();
++
++      releaseFeature();
++      releaseSharedTextures();
++
++      if (parameters) {
++        NVSDK_NGX_D3D12_DestroyParameters(parameters);
++        parameters = nullptr;
++      }
++      if (ngxInitialized) {
++        NVSDK_NGX_D3D12_Shutdown1(d3d12Device.Get());
++        ngxInitialized = false;
++      }
++
++      if (fenceEvent) {
++        CloseHandle(fenceEvent);
++        fenceEvent = nullptr;
++      }
++
++      commandList.Reset();
++      allocator.Reset();
++      queue.Reset();
++      fence.Reset();
++      interopFence.Reset();
++      if (interopSemaphore) {
++        device->vkd()->vkDestroySemaphore(
++          device->handle(),
++          interopSemaphore,
++          nullptr);
++        interopSemaphore = VK_NULL_HANDLE;
++      }
++      d3d12Device.Reset();
++      adapter.Reset();
++
++      if (dxgiModule) {
++        FreeLibrary(dxgiModule);
++        dxgiModule = nullptr;
++      }
++      if (d3d12Module) {
++        FreeLibrary(d3d12Module);
++        d3d12Module = nullptr;
++      }
++
++      initialized = false;
++      statusText = "not initialized";
++    }
++
++    DxvkDevice* device = nullptr;
++    HMODULE d3d12Module = nullptr;
++    HMODULE dxgiModule = nullptr;
++    ComPtr<IDXGIAdapter1> adapter;
++    ComPtr<ID3D12Device> d3d12Device;
++    ComPtr<ID3D12CommandQueue> queue;
++    ComPtr<ID3D12CommandAllocator> allocator;
++    ComPtr<ID3D12GraphicsCommandList> commandList;
++    ComPtr<ID3D12Fence> fence;
++    ComPtr<ID3D12Fence> interopFence;
++    VkSemaphore interopSemaphore = VK_NULL_HANDLE;
++    HANDLE fenceEvent = nullptr;
++    uint64_t fenceValue = 0;
++    uint64_t interopFenceValue = 0;
++
++    NVSDK_NGX_Parameter* parameters = nullptr;
++    NVSDK_NGX_Handle* feature = nullptr;
++    bool ngxInitialized = false;
++    bool initialized = false;
++
++    VkExtent3D extent = {};
++    SharedTexture color;
++    SharedTexture depth;
++    SharedTexture motion;
++    SharedTexture output;
++    const char* statusText = "not initialized";
++  };
++
++  D3D12DlaaInterop::D3D12DlaaInterop(DxvkDevice* device)
++  : m_impl(std::make_unique<Impl>(device)) {
++  }
++
++  D3D12DlaaInterop::~D3D12DlaaInterop() = default;
++
++  bool D3D12DlaaInterop::ensureResources(
++    Rc<DxvkContext> ctx,
++    const VkExtent3D& extent) {
++    return m_impl->ensureResources(std::move(ctx), extent);
++  }
++
++  bool D3D12DlaaInterop::evaluate(
++    Rc<DxvkContext> ctx,
++    bool resetHistory,
++    float jitterX,
++    float jitterY) {
++    return m_impl->evaluate(
++      std::move(ctx),
++      resetHistory,
++      jitterX,
++      jitterY);
++  }
++
++  void D3D12DlaaInterop::release() {
++    m_impl->release();
++  }
++
++  bool D3D12DlaaInterop::isInitialized() const {
++    return m_impl->initialized;
++  }
++
++  const char* D3D12DlaaInterop::status() const {
++    return m_impl->statusText;
++  }
++
++  const Resources::Resource& D3D12DlaaInterop::color() const {
++    return m_impl->color.vulkan;
++  }
++
++  const Resources::Resource& D3D12DlaaInterop::depth() const {
++    return m_impl->depth.vulkan;
++  }
++
++  const Resources::Resource& D3D12DlaaInterop::motion() const {
++    return m_impl->motion.vulkan;
++  }
++
++  const Resources::Resource& D3D12DlaaInterop::output() const {
++    return m_impl->output.vulkan;
++  }
++
++}
+diff --git a/src/dxvk/rtx_render/rtx_d3d12_dlaa.h b/src/dxvk/rtx_render/rtx_d3d12_dlaa.h
+new file mode 100644
+index 00000000..f541f76a
+--- /dev/null
++++ b/src/dxvk/rtx_render/rtx_d3d12_dlaa.h
+@@ -0,0 +1,72 @@
++/*
++ * Copyright (c) 2026
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a
++ * copy of this software and associated documentation files (the "Software"),
++ * to deal in the Software without restriction, including without limitation
++ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
++ * and/or sell copies of the Software, and to permit persons to whom the
++ * Software is furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in
++ * all copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
++ * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
++ * DEALINGS IN THE SOFTWARE.
++ */
++#pragma once
++
++#include "rtx_resources.h"
++
++namespace dxvk {
++
++  class DxvkContext;
++  class DxvkDevice;
++
++  /**
++   * Native-resolution D3D12 DLAA host backed by Vulkan/D3D12 shared images.
++   *
++   * RTX Remix renders through Vulkan, while the RenoDX DLSS 5 ReShade add-on
++   * observes D3D12 NGX evaluations. This bridge gives both APIs access to the
++   * same color, depth, motion-vector and output allocations so that the game
++   * can keep its original raster presentation while exposing a real D3D12
++   * DLAA contract to the add-on.
++   */
++  class D3D12DlaaInterop {
++  public:
++    explicit D3D12DlaaInterop(DxvkDevice* device);
++    ~D3D12DlaaInterop();
++
++    D3D12DlaaInterop(const D3D12DlaaInterop&) = delete;
++    D3D12DlaaInterop& operator=(const D3D12DlaaInterop&) = delete;
++
++    bool ensureResources(
++      Rc<DxvkContext> ctx,
++      const VkExtent3D& extent);
++
++    bool evaluate(
++      Rc<DxvkContext> ctx,
++      bool resetHistory,
++      float jitterX,
++      float jitterY);
++    void release();
++
++    bool isInitialized() const;
++    const char* status() const;
++
++    const Resources::Resource& color() const;
++    const Resources::Resource& depth() const;
++    const Resources::Resource& motion() const;
++    const Resources::Resource& output() const;
++
++  private:
++    struct Impl;
++    std::unique_ptr<Impl> m_impl;
++  };
++
++}
+diff --git a/src/dxvk/rtx_render/rtx_dlss.cpp b/src/dxvk/rtx_render/rtx_dlss.cpp
+index f8333527..92051121 100644
+--- a/src/dxvk/rtx_render/rtx_dlss.cpp
++++ b/src/dxvk/rtx_render/rtx_dlss.cpp
+@@ -29,15 +29,35 @@
+ #include "rtx/pass/tonemap/tonemapping.h"
+ #include "dxvk_device.h"
+ #include "rtx_dlss.h"
++#include "rtx_d3d12_dlaa.h"
+ #include "dxvk_scoped_annotation.h"
+ #include "rtx_ngx_wrapper.h"
+ #include "rtx_render/rtx_shader_manager.h"
+ #include "rtx_imgui.h"
+ 
+ #include "rtx_matrix_helpers.h"
++#include "rtx/pass/raster_dlss/raster_dlss_prepare.h"
++#include <rtx_shaders/raster_dlss_prepare.h>
+ 
+ 
+ namespace dxvk {
++  namespace {
++    class RasterDlssPrepareShader : public ManagedShader {
++      SHADER_SOURCE(
++        RasterDlssPrepareShader,
++        VK_SHADER_STAGE_COMPUTE_BIT,
++        raster_dlss_prepare)
++
++      PUSH_CONSTANTS(RasterDlssPrepareArgs)
++
++      BEGIN_PARAMETER()
++        TEXTURE2D(RASTER_DLSS_DEPTH_INPUT)
++        RW_TEXTURE2D(RASTER_DLSS_DEPTH_OUTPUT)
++        RW_TEXTURE2D(RASTER_DLSS_MOTION_OUTPUT)
++      END_PARAMETER()
++    };
++  }
++
+   const char* dlssProfileToString(DLSSProfile dlssProfile) {
+     switch (dlssProfile) {
+     case DLSSProfile::UltraPerf: return "Ultra Performance";
+@@ -57,11 +77,20 @@ namespace dxvk {
+     if (!m_dlssContext) {
+       m_dlssContext = device->getCommon()->metaNGXContext().createDLSSContext();
+     };
++    m_d3d12Dlaa = std::make_unique<D3D12DlaaInterop>(device);
+   }
+ 
+   DxvkDLSS::~DxvkDLSS() { }
+ 
+   void DxvkDLSS::onDestroy() {
++    releaseNeuralRendering();
++    if (m_d3d12Dlaa) {
++      m_d3d12Dlaa->release();
++    }
++    m_rasterDepth.reset();
++    m_rasterMotion.reset();
++    m_rasterColorView = nullptr;
++    m_rasterDepthView = nullptr;
+     if (m_dlssContext) {
+       m_dlssContext->releaseNGXFeature();
+     }
+@@ -70,6 +99,12 @@ namespace dxvk {
+ 
+   void DxvkDLSS::release() {
+     mRecreate = true;
++    releaseNeuralRendering();
++    if (m_d3d12Dlaa) {
++      m_d3d12Dlaa->release();
++    }
++    m_rasterColorView = nullptr;
++    m_rasterDepthView = nullptr;
+ 
+     if (m_dlssContext) {
+       m_dlssContext->releaseNGXFeature();
+@@ -200,6 +235,11 @@ namespace dxvk {
+     ScopedGpuProfileZone(ctx, "DLSS");
+     ctx->setFramePassStage(RtxFramePassStage::DLSS);
+ 
++    if (!mIsHDR) {
++      mIsHDR = true;
++      mRecreate = true;
++    }
++
+     bool dlssAutoExposure = useDlssAutoExposure();
+     mRecreate |= (mAutoExposure != dlssAutoExposure)
+       || m_prevPreset != preset();
+@@ -318,11 +358,493 @@ namespace dxvk {
+         ctx->getCommandList()->trackResource<DxvkAccess::Write>(output->image());
+       }
+       barriers.recordCommands(ctx->getCommandList());
++
++      dispatchNeuralRendering(
++        ctx,
++        barriers,
++        rtOutput,
++        motionVectorInput,
++        depthInput,
++        resetHistory);
++    }
++  }
++
++  bool DxvkDLSS::dispatchRaster(
++    Rc<RtxContext> ctx,
++    DxvkBarrierSet& barriers,
++    const Rc<DxvkImage>& colorImage,
++    const Rc<DxvkImageView>& depthAttachment,
++    bool resetHistory) {
++    ScopedGpuProfileZone(ctx, "Raster DLSS");
++    ctx->setFramePassStage(RtxFramePassStage::DLSS);
++
++    if (colorImage == nullptr || depthAttachment == nullptr) {
++      return false;
++    }
++
++    const DxvkImageCreateInfo& colorInfo = colorImage->info();
++    const Rc<DxvkImage>& sourceDepthImage = depthAttachment->image();
++    const DxvkImageCreateInfo& sourceDepthInfo = sourceDepthImage->info();
++    if (colorInfo.sampleCount != VK_SAMPLE_COUNT_1_BIT ||
++        sourceDepthInfo.sampleCount != VK_SAMPLE_COUNT_1_BIT ||
++        colorInfo.extent != sourceDepthInfo.extent ||
++        !(colorInfo.usage & VK_IMAGE_USAGE_SAMPLED_BIT) ||
++        !(sourceDepthInfo.usage & VK_IMAGE_USAGE_SAMPLED_BIT)) {
++      ONCE(Logger::warn(
++        "Raster DLSS requires matching, single-sample color and depth images with sampled usage."));
++      return false;
++    }
++
++    const uint32_t displaySize[2] = {
++      colorInfo.extent.width,
++      colorInfo.extent.height
++    };
++    uint32_t renderSize[2] = {};
++    setSetting(displaySize, DLSSProfile::FullResolution, renderSize);
++    if (renderSize[0] != displaySize[0] ||
++        renderSize[1] != displaySize[1]) {
++      ONCE(Logger::warn(
++        "Raster DLSS currently supports native-resolution DLAA only."));
++      return false;
++    }
++
++    if (!m_d3d12Dlaa ||
++        !m_d3d12Dlaa->ensureResources(ctx, colorInfo.extent)) {
++      ++m_rasterFailedEvaluations;
++      return false;
++    }
++
++    if (m_rasterDepthView == nullptr ||
++        m_rasterDepthView->image() != sourceDepthImage) {
++      DxvkImageViewCreateInfo viewInfo = depthAttachment->info();
++      viewInfo.type = VK_IMAGE_VIEW_TYPE_2D;
++      viewInfo.format = sourceDepthInfo.format;
++      viewInfo.usage = VK_IMAGE_USAGE_SAMPLED_BIT;
++      viewInfo.aspect = VK_IMAGE_ASPECT_DEPTH_BIT;
++      viewInfo.minLevel = 0;
++      viewInfo.numLevels = 1;
++      viewInfo.minLayer = 0;
++      viewInfo.numLayers = 1;
++      m_rasterDepthView =
++        m_device->createImageView(sourceDepthImage, viewInfo);
++    }
++
++    const Resources::Resource& sharedColor = m_d3d12Dlaa->color();
++    const Resources::Resource& sharedDepth = m_d3d12Dlaa->depth();
++    const Resources::Resource& sharedMotion = m_d3d12Dlaa->motion();
++    const Resources::Resource& sharedOutput = m_d3d12Dlaa->output();
++
++    RtxContext::blitImageHelper(
++      ctx,
++      colorImage,
++      sharedColor.image,
++      VK_FILTER_NEAREST);
++
++    SceneManager& sceneManager =
++      device()->getCommon()->getSceneManager();
++    RtCamera& camera = sceneManager.getCamera();
++    resetHistory |=
++      camera.isViewHistoryInvalidated(m_device->getCurrentFrameId());
++
++    const Matrix4 clipToPrevClip =
++      camera.getPreviousViewToProjection() *
++      camera.getPreviousWorldToView() *
++      camera.getViewToWorld() *
++      camera.getProjectionToView();
++    float pixelJitter[2] = {};
++    camera.getJittering(pixelJitter);
++    const Matrix4d& viewToProjection =
++      camera.getViewToProjection();
++    const Vector2 currentJitterNdc =
++      camera.calcClipSpaceJitter(
++        Vector2(pixelJitter[0], pixelJitter[1]),
++        Sign(viewToProjection[2][3]),
++        -Sign(viewToProjection[2][3]));
++
++    RasterDlssPrepareArgs prepareArgs = {};
++    prepareArgs.clipToPrevClip = clipToPrevClip;
++    prepareArgs.resolution = {
++      colorInfo.extent.width,
++      colorInfo.extent.height
++    };
++    prepareArgs.currentJitterNdc = {
++      currentJitterNdc.x,
++      currentJitterNdc.y
++    };
++    prepareArgs.resetHistory = resetHistory ? 1u : 0u;
++
++    ctx->pushConstants(
++      0,
++      sizeof(prepareArgs),
++      &prepareArgs);
++    ctx->bindResourceView(
++      RASTER_DLSS_DEPTH_INPUT,
++      m_rasterDepthView,
++      nullptr);
++    ctx->bindResourceView(
++      RASTER_DLSS_DEPTH_OUTPUT,
++      sharedDepth.view,
++      nullptr);
++    ctx->bindResourceView(
++      RASTER_DLSS_MOTION_OUTPUT,
++      sharedMotion.view,
++      nullptr);
++    ctx->bindShader(
++      VK_SHADER_STAGE_COMPUTE_BIT,
++      RasterDlssPrepareShader::getShader());
++
++    const VkExtent3D workgroups = util::computeBlockCount(
++      colorInfo.extent,
++      VkExtent3D {
++        RASTER_DLSS_TILE_SIZE,
++        RASTER_DLSS_TILE_SIZE,
++        1
++      });
++    ctx->dispatch(
++      workgroups.width,
++      workgroups.height,
++      workgroups.depth);
++
++    const std::vector<Rc<DxvkImageView>> inputs = {
++      sharedColor.view,
++      sharedMotion.view,
++      sharedDepth.view
++    };
++    for (const auto& input : inputs) {
++      barriers.accessImage(
++        input->image(),
++        input->imageSubresources(),
++        input->imageInfo().layout,
++        input->imageInfo().stages,
++        input->imageInfo().access,
++        input->imageInfo().layout,
++        VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
++        VK_ACCESS_MEMORY_READ_BIT);
+     }
++    barriers.recordCommands(ctx->getCommandList());
++
++    // The host signals a shared Vulkan/D3D12 timeline fence before and after
++    // the NGX evaluation. The CPU wait is intentionally retained for this
++    // first correctness build, but the fence provides the required memory
++    // visibility and queue ordering across both graphics APIs.
++    const bool success = m_d3d12Dlaa->evaluate(
++      ctx,
++      resetHistory,
++      pixelJitter[0],
++      pixelJitter[1]);
++
++    if (!success) {
++      ++m_rasterFailedEvaluations;
++      return false;
++    }
++
++    ++m_rasterSuccessfulEvaluations;
++    if (!m_rasterFirstSuccessLogged) {
++      m_rasterFirstSuccessLogged = true;
++      Logger::info(
++        "Raster DLSS completed its first D3D12 DLAA host evaluation.");
++    }
++
++    // Acquire visibility of the D3D12 output before Vulkan presents it.
++    ctx->emitMemoryBarrier(
++      0,
++      VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
++      VK_ACCESS_MEMORY_WRITE_BIT,
++      VK_PIPELINE_STAGE_TRANSFER_BIT,
++      VK_ACCESS_TRANSFER_READ_BIT);
++
++    RtxContext::blitImageHelper(
++      ctx,
++      sharedOutput.image,
++      colorImage,
++      VK_FILTER_NEAREST);
++    return true;
+   }
+ 
+   void DxvkDLSS::showImguiSettings() {
+-    RemixGui::Checkbox("Anti-Ghost", &mBiasCurrentColorEnabled);
++    RemixGui::Checkbox(
++      "Vanilla Raster DLSS (DLAA prototype)",
++      &enableRasterDlssObject());
++    if (enableRasterDlss()) {
++      ImGui::Text(
++        "D3D12 DLAA host calls: %llu completed, %llu failed",
++        static_cast<unsigned long long>(m_rasterSuccessfulEvaluations),
++        static_cast<unsigned long long>(m_rasterFailedEvaluations));
++      ImGui::TextWrapped(
++        "Host status: %s",
++        m_d3d12Dlaa ? m_d3d12Dlaa->status() : "unavailable");
++      ImGui::TextUnformatted(
++        "Visible DLAA/Neural Rendering activation must be confirmed in ReShade.");
++      ImGui::TextUnformatted(
++        "Ray tracing remains disabled; the original raster lighting is preserved.");
++    } else {
++      RemixGui::Checkbox("Anti-Ghost", &mBiasCurrentColorEnabled);
++      showNeuralRenderingImguiSettings(true);
++    }
++  }
++
++  void DxvkDLSS::releaseNeuralRendering() {
++    if (m_neuralRenderingContext) {
++      m_neuralRenderingContext->releaseNGXFeature();
++    }
++    m_neuralRenderingContext = nullptr;
++    m_neuralRenderingInputSize[0] = 0;
++    m_neuralRenderingInputSize[1] = 0;
++    m_neuralRenderingOutputSize[0] = 0;
++    m_neuralRenderingOutputSize[1] = 0;
++    m_neuralRenderingReset = true;
++    m_neuralRenderingWasEnabled = false;
++  }
++
++  void DxvkDLSS::dispatchNeuralRendering(
++      Rc<RtxContext> ctx,
++      DxvkBarrierSet& barriers,
++      const Resources::RaytracingOutput& rtOutput,
++      const Resources::Resource* motionVectors,
++      const Resources::Resource* depth,
++      bool resetHistory) {
++    if (!enableNeuralRendering()) {
++      if (m_neuralRenderingWasEnabled) {
++        releaseNeuralRendering();
++      }
++      return;
++    }
++
++    m_neuralRenderingWasEnabled = true;
++
++    const Resources::Resource& color =
++      rtOutput.m_finalOutput.resource(Resources::AccessType::Read);
++    const Resources::Resource& output = rtOutput.m_postFxIntermediateTexture;
++    const VkExtent3D colorExtent = color.image->info().extent;
++    const VkExtent3D outputExtent = output.image->info().extent;
++
++    const bool recreate =
++      m_neuralRenderingInputSize[0] != colorExtent.width ||
++      m_neuralRenderingInputSize[1] != colorExtent.height ||
++      m_neuralRenderingOutputSize[0] != outputExtent.width ||
++      m_neuralRenderingOutputSize[1] != outputExtent.height ||
++      m_prevNeuralRenderingPreset != neuralRenderingPreset();
++
++    if (recreate) {
++      m_device->waitForIdle();
++
++      if (!m_neuralRenderingContext) {
++        m_neuralRenderingContext =
++          m_device->getCommon()->metaNGXContext().createNeuralRenderingContext();
++      }
++
++      m_neuralRenderingInputSize[0] = colorExtent.width;
++      m_neuralRenderingInputSize[1] = colorExtent.height;
++      m_neuralRenderingOutputSize[0] = outputExtent.width;
++      m_neuralRenderingOutputSize[1] = outputExtent.height;
++      m_prevNeuralRenderingPreset = neuralRenderingPreset();
++      m_neuralRenderingReset = true;
++
++      if (m_neuralRenderingContext) {
++        uint32_t inputSize[2] = { colorExtent.width, colorExtent.height };
++        uint32_t outputSize[2] = { outputExtent.width, outputExtent.height };
++
++        bool depthInverted = mInverseDepth;
++        switch (neuralRenderingDepthMode()) {
++        case NeuralRenderingDepthMode::ForceNormal:
++          depthInverted = false;
++          break;
++        case NeuralRenderingDepthMode::ForceInverted:
++          depthInverted = true;
++          break;
++        default:
++          break;
++        }
++
++        m_neuralRenderingContext->initialize(
++          ctx,
++          inputSize,
++          outputSize,
++          mIsHDR,
++          depthInverted,
++          static_cast<uint32_t>(neuralRenderingPreset()));
++      }
++    }
++
++    if (!m_neuralRenderingContext || !m_neuralRenderingContext->isInitialized()) {
++      return;
++    }
++
++    Rc<DxvkImageView> colorView = color.view;
++    Rc<DxvkImageView> outputView = output.view;
++    Rc<DxvkImageView> motionView = motionVectors->view;
++    Rc<DxvkImageView> depthView = depth->view;
++
++    for (const auto& input : { colorView, motionView, depthView }) {
++      barriers.accessImage(
++        input->image(),
++        input->imageSubresources(),
++        input->imageInfo().layout,
++        input->imageInfo().stages,
++        input->imageInfo().access,
++        input->imageInfo().layout,
++        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
++        VK_ACCESS_SHADER_READ_BIT);
++    }
++    barriers.accessImage(
++      outputView->image(),
++      outputView->imageSubresources(),
++      outputView->imageInfo().layout,
++      outputView->imageInfo().stages,
++      outputView->imageInfo().access,
++      outputView->imageInfo().layout,
++      VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
++      VK_ACCESS_SHADER_WRITE_BIT);
++    barriers.recordCommands(ctx->getCommandList());
++
++    bool depthInverted = mInverseDepth;
++    switch (neuralRenderingDepthMode()) {
++    case NeuralRenderingDepthMode::ForceNormal:
++      depthInverted = false;
++      break;
++    case NeuralRenderingDepthMode::ForceInverted:
++      depthInverted = true;
++      break;
++    default:
++      break;
++    }
++
++    NGXNeuralRenderingContext::NGXBuffers buffers;
++    buffers.pColor = &color;
++    buffers.pOutput = &output;
++    buffers.pMotionVectors = motionVectors;
++    buffers.pDepth = depth;
++
++    NGXNeuralRenderingContext::NGXSettings settings;
++    settings.resetAccumulation = resetHistory || m_neuralRenderingReset;
++    settings.depthInverted = depthInverted;
++    settings.useAutoMask = neuralRenderingAutoMask();
++    settings.uiCorrection = neuralRenderingUICorrection();
++    settings.motionVectorScale[0] = neuralRenderingMotionScaleX();
++    settings.motionVectorScale[1] = neuralRenderingMotionScaleY();
++    settings.intensity = neuralRenderingIntensity();
++    settings.localToneStrength = neuralRenderingLocalToneStrength();
++    settings.localStructureStrength = neuralRenderingLocalStructureStrength();
++    settings.skinStructureStrength = neuralRenderingSkinStructureStrength();
++    settings.style = static_cast<uint32_t>(neuralRenderingStyle());
++
++    const bool success = m_neuralRenderingContext->evaluate(ctx, buffers, settings);
++
++    for (const auto& input : { colorView, motionView, depthView }) {
++      barriers.accessImage(
++        input->image(),
++        input->imageSubresources(),
++        input->imageInfo().layout,
++        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
++        VK_ACCESS_SHADER_READ_BIT,
++        input->imageInfo().layout,
++        input->imageInfo().stages,
++        input->imageInfo().access);
++      ctx->getCommandList()->trackResource<DxvkAccess::Read>(input->image());
++    }
++    barriers.accessImage(
++      outputView->image(),
++      outputView->imageSubresources(),
++      outputView->imageInfo().layout,
++      VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
++      VK_ACCESS_SHADER_WRITE_BIT,
++      outputView->imageInfo().layout,
++      outputView->imageInfo().stages,
++      outputView->imageInfo().access);
++    ctx->getCommandList()->trackResource<DxvkAccess::Write>(outputView->image());
++    barriers.recordCommands(ctx->getCommandList());
++
++    if (!success) {
++      return;
++    }
++
++    m_neuralRenderingReset = false;
++    ctx->copyImage(
++      rtOutput.m_finalOutput.resource(Resources::AccessType::Write).image,
++      { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
++      { 0, 0, 0 },
++      output.image,
++      { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
++      { 0, 0, 0 },
++      outputExtent);
++  }
++
++  void DxvkDLSS::showNeuralRenderingImguiSettings(bool showAdvancedSettings) {
++    if (!RemixGui::CollapsingHeader("DLSS Neural Rendering")) {
++      return;
++    }
++
++    ImGui::Indent();
++    bool changed = RemixGui::Checkbox(
++      "Enable Neural Rendering",
++      &enableNeuralRenderingObject());
++
++    if (enableNeuralRendering()) {
++      changed |= RemixGui::Combo(
++        "NR Preset",
++        &neuralRenderingPresetObject(),
++        "Default\0Preset #1\0Preset #2\0Preset #3\0");
++      changed |= RemixGui::Combo(
++        "NR Style",
++        &neuralRenderingStyleObject(),
++        "Default\0Natural\0Cinematic\0");
++      changed |= RemixGui::DragFloat(
++        "NR Intensity",
++        &neuralRenderingIntensityObject(),
++        0.01f, 0.0f, 2.0f, "%.3f", ImGuiSliderFlags_AlwaysClamp);
++      changed |= RemixGui::DragFloat(
++        "Local Tone Strength",
++        &neuralRenderingLocalToneStrengthObject(),
++        0.01f, 0.0f, 2.0f, "%.3f", ImGuiSliderFlags_AlwaysClamp);
++      changed |= RemixGui::DragFloat(
++        "Local Structure Strength",
++        &neuralRenderingLocalStructureStrengthObject(),
++        0.01f, 0.0f, 2.0f, "%.3f", ImGuiSliderFlags_AlwaysClamp);
++      changed |= RemixGui::DragFloat(
++        "Skin Structure Strength",
++        &neuralRenderingSkinStructureStrengthObject(),
++        0.01f, -1.0f, 2.0f, "%.3f", ImGuiSliderFlags_AlwaysClamp);
++      changed |= RemixGui::Checkbox(
++        "Automatic Mask",
++        &neuralRenderingAutoMaskObject());
++      changed |= RemixGui::Checkbox(
++        "UI Correction",
++        &neuralRenderingUICorrectionObject());
++
++      if (showAdvancedSettings) {
++        changed |= RemixGui::Combo(
++          "Depth Convention",
++          &neuralRenderingDepthModeObject(),
++          "Use DLSS Flag\0Force Normal\0Force Inverted\0");
++        changed |= RemixGui::DragFloat(
++          "Motion Scale X",
++          &neuralRenderingMotionScaleXObject(),
++          0.01f, -2.0f, 2.0f, "%.3f", ImGuiSliderFlags_AlwaysClamp);
++        changed |= RemixGui::DragFloat(
++          "Motion Scale Y",
++          &neuralRenderingMotionScaleYObject(),
++          0.01f, -2.0f, 2.0f, "%.3f", ImGuiSliderFlags_AlwaysClamp);
++      }
++
++      if (m_neuralRenderingContext && m_neuralRenderingContext->isInitialized()) {
++        ImGui::Text(
++          "Status: active | successful frames: %llu | failures: %llu",
++          static_cast<unsigned long long>(m_neuralRenderingContext->successfulEvaluations()),
++          static_cast<unsigned long long>(m_neuralRenderingContext->failedEvaluations()));
++      } else {
++        ImGui::TextUnformatted("Status: waiting for feature creation (check Remix log if it stays here)");
++      }
++
++      if (ImGui::Button("Reset Neural Rendering")) {
++        releaseNeuralRendering();
++        changed = true;
++      }
++    }
++
++    if (changed) {
++      m_neuralRenderingReset = true;
++    }
++    ImGui::Unindent();
+   }
+ 
+   void DxvkDLSS::initializeDLSS(Rc<DxvkContext> renderContext) {
+diff --git a/src/dxvk/rtx_render/rtx_dlss.h b/src/dxvk/rtx_render/rtx_dlss.h
+index 14c60ea1..379f7ba7 100644
+--- a/src/dxvk/rtx_render/rtx_dlss.h
++++ b/src/dxvk/rtx_render/rtx_dlss.h
+@@ -35,9 +35,11 @@
+ namespace dxvk {
+ 
+   class NGXDLSSContext;
++  class NGXNeuralRenderingContext;
+   class DxvkCommandList;
+   class DxvkBarrierSet;
+   class DxvkContext;
++  class D3D12DlaaInterop;
+ 
+   enum class DLSSProfile : uint32_t {
+     UltraPerf = 0,
+@@ -74,6 +76,25 @@ namespace dxvk {
+       M = 13,
+     };
+ 
++    enum class NeuralRenderingPreset : uint32_t {
++      Default = 0,
++      Preset1 = 1,
++      Preset2 = 2,
++      Preset3 = 3,
++    };
++
++    enum class NeuralRenderingStyle : uint32_t {
++      Default = 0,
++      Natural = 1,
++      Cinematic = 2,
++    };
++
++    enum class NeuralRenderingDepthMode : uint32_t {
++      UseDLSSFlag = 0,
++      ForceNormal = 1,
++      ForceInverted = 2,
++    };
++
+     explicit DxvkDLSS(DxvkDevice* device);
+     ~DxvkDLSS();
+     static NVSDK_NGX_PerfQuality_Value profileToQuality(DLSSProfile profile);
+@@ -95,6 +116,13 @@ namespace dxvk {
+       const Resources::RaytracingOutput& rtOutput,
+       bool resetHistory = false);
+ 
++    bool dispatchRaster(
++      Rc<RtxContext> ctx,
++      DxvkBarrierSet& barriers,
++      const Rc<DxvkImage>& colorImage,
++      const Rc<DxvkImageView>& depthAttachment,
++      bool resetHistory = false);
++
+     void showImguiSettings();
+ 
+     void onDestroy();
+@@ -104,6 +132,46 @@ namespace dxvk {
+     RTX_OPTION_ARGS("rtx.dlss", DLSSPreset, preset, DLSSPreset::Default,
+                     "Render preset for DLSS Super Resolution. Default = 0 (DLSS picks the best preset), J = 10, K = 11, L = 12, M = 13.",
+                     args.flags = RtxOptionFlags::UserSetting);
++    RTX_OPTION_ARGS("rtx.rasterDlss", bool, enableRasterDlss, false,
++                    "Runs DLSS on the original D3D9 raster image while ray tracing is disabled. "
++                    "The initial mode is native-resolution DLAA and preserves the game's original lighting.",
++                    args.flags = RtxOptionFlags::UserSetting | RtxOptionFlags::InvalidatesDrawcallTranslation);
++    RTX_OPTION_ARGS("rtx.neuralRendering", bool, enableNeuralRendering, false,
++                    "Run DLSS Neural Rendering feature 18 after DLSS or Ray Reconstruction.",
++                    args.flags = RtxOptionFlags::UserSetting);
++    RTX_OPTION_ARGS("rtx.neuralRendering", NeuralRenderingPreset, neuralRenderingPreset, NeuralRenderingPreset::Preset1,
++                    "DLSS Neural Rendering model preset.",
++                    args.flags = RtxOptionFlags::UserSetting);
++    RTX_OPTION_ARGS("rtx.neuralRendering", NeuralRenderingStyle, neuralRenderingStyle, NeuralRenderingStyle::Natural,
++                    "DLSS Neural Rendering image style.",
++                    args.flags = RtxOptionFlags::UserSetting);
++    RTX_OPTION_ARGS("rtx.neuralRendering", float, neuralRenderingIntensity, 1.0f,
++                    "DLSS Neural Rendering intensity in the range 0 to 2.",
++                    args.flags = RtxOptionFlags::UserSetting);
++    RTX_OPTION_ARGS("rtx.neuralRendering", float, neuralRenderingLocalToneStrength, 1.0f,
++                    "DLSS Neural Rendering local tone strength in the range 0 to 2.",
++                    args.flags = RtxOptionFlags::UserSetting);
++    RTX_OPTION_ARGS("rtx.neuralRendering", float, neuralRenderingLocalStructureStrength, 1.0f,
++                    "DLSS Neural Rendering local structure strength in the range 0 to 2.",
++                    args.flags = RtxOptionFlags::UserSetting);
++    RTX_OPTION_ARGS("rtx.neuralRendering", float, neuralRenderingSkinStructureStrength, -1.0f,
++                    "DLSS Neural Rendering skin structure strength in the range -1 to 2. -1 uses the runtime default.",
++                    args.flags = RtxOptionFlags::UserSetting);
++    RTX_OPTION_ARGS("rtx.neuralRendering", bool, neuralRenderingAutoMask, true,
++                    "Enable DLSS Neural Rendering automatic masking.",
++                    args.flags = RtxOptionFlags::UserSetting);
++    RTX_OPTION_ARGS("rtx.neuralRendering", bool, neuralRenderingUICorrection, false,
++                    "Enable DLSS Neural Rendering UI correction. Remix does not currently supply separate UI textures.",
++                    args.flags = RtxOptionFlags::UserSetting);
++    RTX_OPTION_ARGS("rtx.neuralRendering", NeuralRenderingDepthMode, neuralRenderingDepthMode, NeuralRenderingDepthMode::UseDLSSFlag,
++                    "Depth convention for DLSS Neural Rendering.",
++                    args.flags = RtxOptionFlags::UserSetting);
++    RTX_OPTION_ARGS("rtx.neuralRendering", float, neuralRenderingMotionScaleX, 1.0f,
++                    "Multiplier for the DLSS motion-vector X scale.",
++                    args.flags = RtxOptionFlags::UserSetting);
++    RTX_OPTION_ARGS("rtx.neuralRendering", float, neuralRenderingMotionScaleY, 1.0f,
++                    "Multiplier for the DLSS motion-vector Y scale.",
++                    args.flags = RtxOptionFlags::UserSetting);
+ 
+   protected:
+     virtual bool isEnabled() const override;
+@@ -111,6 +179,15 @@ namespace dxvk {
+     static DLSSProfile getAutoProfile(uint32_t displayWidth, uint32_t displayHeight);
+ 
+     void initializeDLSS(Rc<DxvkContext> pRenderContext);
++    void dispatchNeuralRendering(
++      Rc<RtxContext> ctx,
++      DxvkBarrierSet& barriers,
++      const Resources::RaytracingOutput& rtOutput,
++      const Resources::Resource* motionVectors,
++      const Resources::Resource* depth,
++      bool resetHistory);
++    void showNeuralRenderingImguiSettings(bool showAdvancedSettings);
++    void releaseNeuralRendering();
+ 
+     bool useDlssAutoExposure() const;
+ 
+@@ -130,5 +207,20 @@ namespace dxvk {
+ 
+     bool                        mBiasCurrentColorEnabled = false;
+     std::unique_ptr < NGXDLSSContext > m_dlssContext;
++    std::unique_ptr<D3D12DlaaInterop> m_d3d12Dlaa;
++    std::unique_ptr<NGXNeuralRenderingContext> m_neuralRenderingContext;
++    NeuralRenderingPreset       m_prevNeuralRenderingPreset = NeuralRenderingPreset::Default;
++    uint32_t                    m_neuralRenderingInputSize[2] = {};
++    uint32_t                    m_neuralRenderingOutputSize[2] = {};
++    bool                        m_neuralRenderingReset = true;
++    bool                        m_neuralRenderingWasEnabled = false;
++
++    Resources::Resource         m_rasterDepth;
++    Resources::Resource         m_rasterMotion;
++    Rc<DxvkImageView>            m_rasterColorView;
++    Rc<DxvkImageView>            m_rasterDepthView;
++    uint64_t                     m_rasterSuccessfulEvaluations = 0;
++    uint64_t                     m_rasterFailedEvaluations = 0;
++    bool                         m_rasterFirstSuccessLogged = false;
+   };
+ }  // namespace dxvk
+diff --git a/src/dxvk/rtx_render/rtx_ngx_wrapper.cpp b/src/dxvk/rtx_render/rtx_ngx_wrapper.cpp
+index 860d815c..49cb3260 100644
+--- a/src/dxvk/rtx_render/rtx_ngx_wrapper.cpp
++++ b/src/dxvk/rtx_render/rtx_ngx_wrapper.cpp
+@@ -57,6 +57,42 @@
+ 
+ namespace dxvk
+ {
++  struct NGXNeuralRenderingDispatch {
++    using InitFn = NVSDK_NGX_Result (NVSDK_CONV*)(
++      unsigned long long,
++      const wchar_t*,
++      NVSDK_NGX_Version,
++      const NVSDK_NGX_Parameter*,
++      VkDevice,
++      VkInstance,
++      VkPhysicalDevice,
++      PFN_vkGetInstanceProcAddr,
++      PFN_vkGetDeviceProcAddr);
++    using CreateFeatureFn = NVSDK_NGX_Result (NVSDK_CONV*)(
++      VkDevice,
++      VkCommandBuffer,
++      NVSDK_NGX_Feature,
++      const NVSDK_NGX_Parameter*,
++      NVSDK_NGX_Handle**);
++    using EvaluateFeatureFn = NVSDK_NGX_Result (NVSDK_CONV*)(
++      VkCommandBuffer,
++      const NVSDK_NGX_Handle*,
++      const NVSDK_NGX_Parameter*,
++      PFN_NVSDK_NGX_ProgressCallback);
++    using ReleaseFeatureFn = NVSDK_NGX_Result (NVSDK_CONV*)(NVSDK_NGX_Handle*);
++    using ShutdownFn = NVSDK_NGX_Result (NVSDK_CONV*)(VkDevice, bool);
++
++    HMODULE module = nullptr;
++    InitFn init = nullptr;
++    CreateFeatureFn createFeature = nullptr;
++    EvaluateFeatureFn evaluateFeature = nullptr;
++    ReleaseFeatureFn releaseFeature = nullptr;
++    ShutdownFn shutdown = nullptr;
++    void* computeScalingRatio = nullptr;
++    void* getStats = nullptr;
++    bool initialized = false;
++  };
++
+   namespace {
+     std::string resultToString(NVSDK_NGX_Result result) {
+       char buf[1024];
+@@ -80,6 +116,17 @@ namespace dxvk
+ 
+       return ViewToResourceVK(tex->view, isUAV);
+     }
++
++    NVSDK_NGX_Result NVSDK_CONV computeNeuralRenderingScalingRatio(NVSDK_NGX_Parameter* params) {
++      if (params == nullptr) {
++        return NVSDK_NGX_Result_FAIL_InvalidParameter;
++      }
++
++      int upscaling = 0;
++      params->Get("DLSSNR.Upscaling", &upscaling);
++      params->Set("DLSSNR.ScalingRatio", upscaling ? 0.5f : 1.0f);
++      return NVSDK_NGX_Result_Success;
++    }
+   }
+ 
+   void NVSDK_CONV NVSDK_NGX_AppLogCallback(const char* message, NVSDK_NGX_Logging_Level loggingLevel, NVSDK_NGX_Feature sourceComponent) {
+@@ -260,6 +307,18 @@ namespace dxvk
+     return std::make_unique<NGXRayReconstructionContext>(m_device);
+   }
+ 
++  std::unique_ptr<NGXNeuralRenderingContext> NGXContext::createNeuralRenderingContext() {
++    if (!m_initialized) {
++      if (!initialize()) {
++        return nullptr;
++      }
++    }
++
++    // Feature 18 has no public capability flag in the current NGX headers.
++    // Creation is therefore the authoritative support check.
++    return std::make_unique<NGXNeuralRenderingContext>(m_device);
++  }
++
+   std::unique_ptr<NGXDLFGContext> NGXContext::createDLFGContext() {
+     if (!m_initialized) {
+       if (!initialize()) {
+@@ -781,6 +840,331 @@ namespace dxvk
+     return success;
+   }
+ 
++  NGXNeuralRenderingContext::NGXNeuralRenderingContext(DxvkDevice* device)
++    : NGXFeatureContext(device) {
++  }
++
++  NGXNeuralRenderingContext::~NGXNeuralRenderingContext() {
++    releaseNGXFeature();
++    shutdownSnippet();
++  }
++
++  bool NGXNeuralRenderingContext::initializeSnippet() {
++    if (m_dispatch && m_dispatch->initialized) {
++      return true;
++    }
++
++    const std::string exePath = env::getExePath();
++    const std::string exeFolder = exePath.substr(0, exePath.find_last_of("\\/"));
++    const std::wstring dllPath =
++      str::tows(exeFolder.c_str()) + L"\\.trex\\nvngx_dlssnr.dll";
++
++    auto dispatch = std::make_unique<NGXNeuralRenderingDispatch>();
++    dispatch->module = LoadLibraryW(dllPath.c_str());
++    if (dispatch->module == nullptr) {
++      Logger::warn(str::format(
++        "DLSS Neural Rendering runtime was not found at ",
++        str::fromws(dllPath.c_str()), "."));
++      return false;
++    }
++
++    auto* moduleBase = reinterpret_cast<uint8_t*>(dispatch->module);
++    auto* exportedInit = reinterpret_cast<uint8_t*>(
++      GetProcAddress(dispatch->module, "NVSDK_NGX_VULKAN_Init_Ext2"));
++    auto* exportedCreate = reinterpret_cast<uint8_t*>(
++      GetProcAddress(dispatch->module, "NVSDK_NGX_VULKAN_CreateFeature1"));
++    auto* exportedEvaluate = GetProcAddress(
++      dispatch->module, "NVSDK_NGX_VULKAN_EvaluateFeature");
++
++    // The 310.8 DLSSNR snippet only accepts its public entry points when
++    // nvngx.dll is the direct caller. Remix's NGX core does not currently
++    // route reserved feature 18 to this snippet, so use the snippet's native
++    // implementations after positively identifying this exact runtime layout.
++    constexpr ptrdiff_t kInitExportRva = 0x251a0;
++    constexpr ptrdiff_t kCreateExportRva = 0x24b70;
++    constexpr ptrdiff_t kInitImplementationRva = 0x23dd0;
++    constexpr ptrdiff_t kCreateImplementationRva = 0x23c70;
++    constexpr ptrdiff_t kReleaseImplementationRva = 0x240a0;
++    constexpr ptrdiff_t kShutdownImplementationRva = 0x24290;
++    constexpr ptrdiff_t kComputeScalingRatioRva = 0x248c0;
++    constexpr ptrdiff_t kGetStatsRva = 0x12e80;
++
++    if (exportedInit != moduleBase + kInitExportRva ||
++        exportedCreate != moduleBase + kCreateExportRva ||
++        exportedEvaluate == nullptr) {
++      Logger::warn(
++        "nvngx_dlssnr.dll is not the supported 310.8 runtime layout. "
++        "DLSS Neural Rendering will remain disabled rather than calling "
++        "unknown private entry points.");
++      FreeLibrary(dispatch->module);
++      return false;
++    }
++
++    dispatch->init = reinterpret_cast<NGXNeuralRenderingDispatch::InitFn>(
++      moduleBase + kInitImplementationRva);
++    dispatch->createFeature =
++      reinterpret_cast<NGXNeuralRenderingDispatch::CreateFeatureFn>(
++        moduleBase + kCreateImplementationRva);
++    dispatch->evaluateFeature =
++      reinterpret_cast<NGXNeuralRenderingDispatch::EvaluateFeatureFn>(
++        exportedEvaluate);
++    dispatch->releaseFeature =
++      reinterpret_cast<NGXNeuralRenderingDispatch::ReleaseFeatureFn>(
++        moduleBase + kReleaseImplementationRva);
++    dispatch->shutdown =
++      reinterpret_cast<NGXNeuralRenderingDispatch::ShutdownFn>(
++        moduleBase + kShutdownImplementationRva);
++    dispatch->computeScalingRatio = moduleBase + kComputeScalingRatioRva;
++    dispatch->getStats = moduleBase + kGetStatsRva;
++
++    auto adapter = m_device->adapter();
++    auto instance = m_device->instance();
++    m_lastResult = dispatch->init(
++      RtxOptions::applicationId(),
++      str::tows(exeFolder.c_str()).c_str(),
++      NVSDK_NGX_Version_API,
++      m_parameters,
++      m_device->handle(),
++      instance->handle(),
++      adapter->handle(),
++      nullptr,
++      nullptr);
++    if (NVSDK_NGX_FAILED(m_lastResult)) {
++      Logger::warn(str::format(
++        "Failed to initialize the DLSS Neural Rendering 310.8 snippet: ",
++        resultToString(m_lastResult), "."));
++      FreeLibrary(dispatch->module);
++      return false;
++    }
++
++    dispatch->initialized = true;
++    m_dispatch = std::move(dispatch);
++    Logger::info(
++      "Initialized the DLSS Neural Rendering 310.8 snippet through its "
++      "native Vulkan implementation.");
++    return true;
++  }
++
++  void NGXNeuralRenderingContext::shutdownSnippet() {
++    if (!m_dispatch) {
++      return;
++    }
++
++    if (m_dispatch->initialized && m_dispatch->shutdown != nullptr) {
++      m_dispatch->shutdown(m_device->handle(), true);
++      m_dispatch->initialized = false;
++    }
++    if (m_dispatch->module != nullptr) {
++      FreeLibrary(m_dispatch->module);
++      m_dispatch->module = nullptr;
++    }
++    m_dispatch.reset();
++  }
++
++  void NGXNeuralRenderingContext::initialize(
++      Rc<DxvkContext> renderContext,
++      uint32_t inputSize[2],
++      uint32_t outputSize[2],
++      bool isContentHDR,
++      bool depthInverted,
++      uint32_t preset) {
++    ScopedCpuProfileZone();
++
++    releaseNGXFeature();
++    m_successfulEvaluations = 0;
++    m_failedEvaluations = 0;
++    m_consecutiveFailures = 0;
++    m_failureLatched = false;
++
++    if (m_parameters == nullptr) {
++      Logger::err("DLSS Neural Rendering could not allocate NGX parameters");
++      return;
++    }
++    if (!initializeSnippet()) {
++      return;
++    }
++
++    constexpr int upscaling = 0;
++    constexpr float scalingRatio = 1.0f;
++
++    int createFlags = NVSDK_NGX_DLSS_Feature_Flags_MVLowRes;
++    createFlags |= isContentHDR ? NVSDK_NGX_DLSS_Feature_Flags_IsHDR : 0;
++    createFlags |= depthInverted ? NVSDK_NGX_DLSS_Feature_Flags_DepthInverted : 0;
++
++    m_parameters->Set("Width", inputSize[0]);
++    m_parameters->Set("Height", inputSize[1]);
++    m_parameters->Set("OutWidth", outputSize[0]);
++    m_parameters->Set("OutHeight", outputSize[1]);
++    m_parameters->Set("DLSSNR.Width", outputSize[0]);
++    m_parameters->Set("DLSSNR.Height", outputSize[1]);
++    m_parameters->Set("DLSSNR.InputWidth", inputSize[0]);
++    m_parameters->Set("DLSSNR.InputHeight", inputSize[1]);
++    m_parameters->Set("DLSSNR.OutputWidth", outputSize[0]);
++    m_parameters->Set("DLSSNR.OutputHeight", outputSize[1]);
++    m_parameters->Set("DLSSNR.Output.Width", outputSize[0]);
++    m_parameters->Set("DLSSNR.Output.Height", outputSize[1]);
++    m_parameters->Set("DLSSNR.ScalingRatio", scalingRatio);
++    m_parameters->Set("DLSSNR.Scale", scalingRatio);
++    m_parameters->Set("DLSSNR.Upscaling", upscaling);
++    m_parameters->Set(
++      "DLSSNRComputeScalingRatioCallback",
++      m_dispatch->computeScalingRatio);
++    m_parameters->Set("DLSSNRGetStatsCallback", m_dispatch->getStats);
++    m_parameters->Set("DLSSNR.Hint.Render.Preset", preset);
++    m_parameters->Set("PerfQualityValue", static_cast<int>(NVSDK_NGX_PerfQuality_Value_MaxPerf));
++    m_parameters->Set("DLSS.Feature.Create.Flags", createFlags);
++    m_parameters->Set("CreationNodeMask", 1u);
++    m_parameters->Set("VisibilityNodeMask", 1u);
++    m_parameters->Set(NVSDK_NGX_Parameter_FreeMemOnReleaseFeature, 1);
++
++    VkCommandBuffer commandBuffer =
++      renderContext->getCommandList()->getCmdBuffer(DxvkCmdBuffer::ExecBuffer);
++    constexpr NVSDK_NGX_Feature neuralRenderingFeature =
++      static_cast<NVSDK_NGX_Feature>(NVSDK_NGX_Feature_Reserved18);
++
++    m_lastResult = m_dispatch->createFeature(
++      m_device->handle(),
++      commandBuffer,
++      neuralRenderingFeature,
++      m_parameters,
++      &m_feature);
++
++    if (NVSDK_NGX_FAILED(m_lastResult) || m_feature == nullptr) {
++      Logger::warn(str::format(
++        "Failed to create DLSS Neural Rendering feature 18: ",
++        resultToString(m_lastResult),
++        ". Normal DLSS/Ray Reconstruction will remain active."));
++      m_feature = nullptr;
++      return;
++    }
++
++    Logger::info(str::format(
++      "Created DLSS Neural Rendering feature 18 in native mode at ",
++      inputSize[0], "x", inputSize[1], " -> ",
++      outputSize[0], "x", outputSize[1], "."));
++  }
++
++  void NGXNeuralRenderingContext::releaseNGXFeature() {
++    if (m_feature != nullptr) {
++      if (m_dispatch && m_dispatch->releaseFeature) {
++        m_dispatch->releaseFeature(m_feature);
++      } else {
++        NVSDK_NGX_VULKAN_ReleaseFeature(m_feature);
++      }
++      m_feature = nullptr;
++    }
++  }
++
++  bool NGXNeuralRenderingContext::evaluate(
++      Rc<DxvkContext> renderContext,
++      const NGXBuffers& buffers,
++      const NGXSettings& settings) {
++    if (m_feature == nullptr || m_parameters == nullptr || m_failureLatched) {
++      return false;
++    }
++
++    ScopedCpuProfileZone();
++
++    const uint32_t colorWidth = buffers.pColor->image->info().extent.width;
++    const uint32_t colorHeight = buffers.pColor->image->info().extent.height;
++    const uint32_t outputWidth = buffers.pOutput->image->info().extent.width;
++    const uint32_t outputHeight = buffers.pOutput->image->info().extent.height;
++    const uint32_t guideWidth = buffers.pDepth->image->info().extent.width;
++    const uint32_t guideHeight = buffers.pDepth->image->info().extent.height;
++
++    NVSDK_NGX_Resource_VK color = TextureToResourceVK(buffers.pColor, false);
++    NVSDK_NGX_Resource_VK output = TextureToResourceVK(buffers.pOutput, true);
++    NVSDK_NGX_Resource_VK motionVectors = TextureToResourceVK(buffers.pMotionVectors, false);
++    NVSDK_NGX_Resource_VK depth = TextureToResourceVK(buffers.pDepth, false);
++
++    m_parameters->Set("DLSSNR.Color", static_cast<void*>(&color));
++    m_parameters->Set("DLSSNR.Output", static_cast<void*>(&output));
++    m_parameters->Set("DLSSNR.MVec", static_cast<void*>(&motionVectors));
++    m_parameters->Set("DLSSNR.Depth", static_cast<void*>(&depth));
++
++    m_parameters->Set("Width", colorWidth);
++    m_parameters->Set("Height", colorHeight);
++    m_parameters->Set("OutWidth", outputWidth);
++    m_parameters->Set("OutHeight", outputHeight);
++
++    m_parameters->Set("DLSSNR.ColorSubrectBaseX", 0u);
++    m_parameters->Set("DLSSNR.ColorSubrectBaseY", 0u);
++    m_parameters->Set("DLSSNR.ColorSubrectWidth", colorWidth);
++    m_parameters->Set("DLSSNR.ColorSubrectHeight", colorHeight);
++    m_parameters->Set("DLSSNR.DepthSubrectBaseX", 0u);
++    m_parameters->Set("DLSSNR.DepthSubrectBaseY", 0u);
++    m_parameters->Set("DLSSNR.DepthSubrectWidth", guideWidth);
++    m_parameters->Set("DLSSNR.DepthSubrectHeight", guideHeight);
++    m_parameters->Set("DLSSNR.MVecSubrectBaseX", 0u);
++    m_parameters->Set("DLSSNR.MVecSubrectBaseY", 0u);
++    m_parameters->Set("DLSSNR.MVecSubrectWidth", guideWidth);
++    m_parameters->Set("DLSSNR.MVecSubrectHeight", guideHeight);
++    m_parameters->Set("DLSSNR.OutputSubrectBaseX", 0u);
++    m_parameters->Set("DLSSNR.OutputSubrectBaseY", 0u);
++    m_parameters->Set("DLSSNR.OutputSubrectWidth", outputWidth);
++    m_parameters->Set("DLSSNR.OutputSubrectHeight", outputHeight);
++
++    m_parameters->Set("DLSSNR.InputWidth", colorWidth);
++    m_parameters->Set("DLSSNR.InputHeight", colorHeight);
++    m_parameters->Set("DLSSNR.OutputWidth", outputWidth);
++    m_parameters->Set("DLSSNR.OutputHeight", outputHeight);
++    m_parameters->Set("DLSSNR.ScalingRatio", 1.0f);
++    m_parameters->Set("DLSSNR.Scale", 1.0f);
++    m_parameters->Set("DLSSNR.Upscaling", 0);
++    m_parameters->Set(
++      "DLSSNRComputeScalingRatioCallback",
++      m_dispatch->computeScalingRatio);
++    m_parameters->Set("DLSSNRGetStatsCallback", m_dispatch->getStats);
++    m_parameters->Set("DLSSNR.MVecScaleX", settings.motionVectorScale[0]);
++    m_parameters->Set("DLSSNR.MVecScaleY", settings.motionVectorScale[1]);
++    m_parameters->Set("DLSSNR.DepthInverted", settings.depthInverted ? 1 : 0);
++    m_parameters->Set("DLSSNR.Enabled", 1);
++    m_parameters->Set("DLSSNR.Reset", settings.resetAccumulation ? 1 : 0);
++    m_parameters->Set("DLSSNR.Intensity", settings.intensity);
++    m_parameters->Set("DLSSNR.LocalToneStrength", settings.localToneStrength);
++    m_parameters->Set("DLSSNR.LocalStructureStrength", settings.localStructureStrength);
++    m_parameters->Set("DLSSNR.SkinStructureStrength", settings.skinStructureStrength);
++    m_parameters->Set("DLSSNR.UseAutoMask", settings.useAutoMask ? 1 : 0);
++    m_parameters->Set("DLSSNR.Style", settings.style);
++    m_parameters->Set("DLSSNR.UICorrection", settings.uiCorrection ? 1 : 0);
++    m_parameters->Set("DLSS.Indicator.Invert.X.Axis", 0);
++    m_parameters->Set("DLSS.Indicator.Invert.Y.Axis", 0);
++
++    VkCommandBuffer commandBuffer =
++      renderContext->getCommandList()->getCmdBuffer(DxvkCmdBuffer::ExecBuffer);
++    m_lastResult = m_dispatch->evaluateFeature(
++      commandBuffer, m_feature, m_parameters, nullptr);
++
++    if (NVSDK_NGX_FAILED(m_lastResult)) {
++      ++m_failedEvaluations;
++      ++m_consecutiveFailures;
++      if (m_consecutiveFailures == 1) {
++        Logger::warn(str::format(
++          "DLSS Neural Rendering evaluation failed: ",
++          resultToString(m_lastResult),
++          ". Preserving the normal DLSS/Ray Reconstruction output."));
++      }
++      if (m_consecutiveFailures >= 3) {
++        m_failureLatched = true;
++        Logger::warn(
++          "DLSS Neural Rendering disabled after 3 consecutive failures. "
++          "Toggle it off/on or press its reset button to retry.");
++      }
++      return false;
++    }
++
++    m_consecutiveFailures = 0;
++    ++m_successfulEvaluations;
++    if (m_successfulEvaluations == 1) {
++      Logger::info(str::format(
++        "DLSS Neural Rendering produced its first frame (color ",
++        colorWidth, "x", colorHeight, ", guides ",
++        guideWidth, "x", guideHeight, ", output ",
++        outputWidth, "x", outputHeight, ")."));
++    }
++    return true;
++  }
++
+   NGXDLFGContext::NGXDLFGContext(DxvkDevice* device)
+     : NGXFeatureContext(device) { }
+ 
+diff --git a/src/dxvk/rtx_render/rtx_ngx_wrapper.h b/src/dxvk/rtx_render/rtx_ngx_wrapper.h
+index 1b8d9078..4c6567c6 100644
+--- a/src/dxvk/rtx_render/rtx_ngx_wrapper.h
++++ b/src/dxvk/rtx_render/rtx_ngx_wrapper.h
+@@ -70,6 +70,8 @@ namespace dxvk {
+ 
+   class NGXDLSSContext;
+   class NGXRayReconstructionContext;
++  struct NGXNeuralRenderingDispatch;
++  class NGXNeuralRenderingContext;
+   class NGXDLFGContext;
+   class NGXContext final {
+   public:
+@@ -108,6 +110,7 @@ namespace dxvk {
+     
+     std::unique_ptr<NGXDLSSContext> createDLSSContext();
+     std::unique_ptr<NGXRayReconstructionContext> createRayReconstructionContext();
++    std::unique_ptr<NGXNeuralRenderingContext> createNeuralRenderingContext();
+     std::unique_ptr<NGXDLFGContext> createDLFGContext();
+     
+   private:
+@@ -311,6 +314,83 @@ namespace dxvk {
+     Matrix4 m_viewToProjectionMatrix;
+   };
+ 
++  // DLSS Neural Rendering is exposed by NGX as feature 18 in the 310.8
++  // runtime. The public SDK does not yet provide typed helpers for it, so this
++  // wrapper intentionally uses the generic NGX parameter API.
++  class NGXNeuralRenderingContext final : public NGXFeatureContext {
++  public:
++    struct NGXBuffers {
++      const Resources::Resource* pColor;
++      const Resources::Resource* pOutput;
++      const Resources::Resource* pMotionVectors;
++      const Resources::Resource* pDepth;
++    };
++
++    struct NGXSettings {
++      bool resetAccumulation;
++      bool depthInverted;
++      bool useAutoMask;
++      bool uiCorrection;
++      float motionVectorScale[2];
++      float intensity;
++      float localToneStrength;
++      float localStructureStrength;
++      float skinStructureStrength;
++      uint32_t style;
++    };
++
++    void initialize(
++      Rc<DxvkContext> renderContext,
++      uint32_t inputSize[2],
++      uint32_t outputSize[2],
++      bool isContentHDR,
++      bool depthInverted,
++      uint32_t preset);
++
++    void releaseNGXFeature() override;
++
++    bool isInitialized() const {
++      return m_feature != nullptr;
++    }
++
++    bool evaluate(
++      Rc<DxvkContext> renderContext,
++      const NGXBuffers& buffers,
++      const NGXSettings& settings);
++
++    NVSDK_NGX_Result lastResult() const {
++      return m_lastResult;
++    }
++
++    uint64_t successfulEvaluations() const {
++      return m_successfulEvaluations;
++    }
++
++    uint64_t failedEvaluations() const {
++      return m_failedEvaluations;
++    }
++
++    explicit NGXNeuralRenderingContext(DxvkDevice* device);
++    ~NGXNeuralRenderingContext() override;
++
++    NGXNeuralRenderingContext(const NGXNeuralRenderingContext&) = delete;
++    NGXNeuralRenderingContext(NGXNeuralRenderingContext&&) noexcept = delete;
++    NGXNeuralRenderingContext& operator=(const NGXNeuralRenderingContext&) = delete;
++    NGXNeuralRenderingContext& operator=(NGXNeuralRenderingContext&&) noexcept = delete;
++
++  private:
++    bool initializeSnippet();
++    void shutdownSnippet();
++
++    std::unique_ptr<NGXNeuralRenderingDispatch> m_dispatch;
++    NVSDK_NGX_Handle* m_feature = nullptr;
++    NVSDK_NGX_Result m_lastResult = NVSDK_NGX_Result_Fail;
++    uint64_t m_successfulEvaluations = 0;
++    uint64_t m_failedEvaluations = 0;
++    uint32_t m_consecutiveFailures = 0;
++    bool m_failureLatched = false;
++  };
++
+   class NGXDLFGContext final : public NGXFeatureContext {
+   public:
+     typedef enum {
+diff --git a/src/dxvk/rtx_render/rtx_ray_reconstruction.cpp b/src/dxvk/rtx_render/rtx_ray_reconstruction.cpp
+index 6dc84539..990872d4 100644
+--- a/src/dxvk/rtx_render/rtx_ray_reconstruction.cpp
++++ b/src/dxvk/rtx_render/rtx_ray_reconstruction.cpp
+@@ -114,6 +114,7 @@ namespace dxvk {
+ 
+   void DxvkRayReconstruction::release() {
+     m_rayReconstructionContext = {};
++    releaseNeuralRendering();
+     mRecreate = true;
+   }
+   
+@@ -352,11 +353,20 @@ namespace dxvk {
+         ctx->getCommandList()->trackResource<DxvkAccess::Write>(output->image());
+       }
+       barriers.recordCommands(ctx->getCommandList());
++
++      dispatchNeuralRendering(
++        ctx,
++        barriers,
++        rtOutput,
++        motionVectorInput,
++        depthInput,
++        resetHistory);
+     }
+   }
+ 
+   void DxvkRayReconstruction::showRayReconstructionImguiSettings(bool showAdvancedSettings) {
+     RemixGui::Checkbox("Anti-Ghost", &m_biasCurrentColorEnabled);
++    showNeuralRenderingImguiSettings(true);
+ 
+     if (showAdvancedSettings) {
+       bool presetChanged = RemixGui::Combo("DLSS-RR Preset", &pathTracerPresetObject(), "Default\0ReSTIR Finetuned\0");
+@@ -462,4 +472,4 @@ namespace dxvk {
+       m_rayReconstructionContext->initialize(renderContext, mInputSize, mDLSSOutputSize, mIsHDR, mInverseDepth, mAutoExposure, false, dlssdModel, perfQuality);
+     }
+   }
+-} // namespace dxvk
+\ No newline at end of file
++} // namespace dxvk
+diff --git a/src/dxvk/shaders/rtx/pass/raster_dlss/raster_dlss_prepare.comp.slang b/src/dxvk/shaders/rtx/pass/raster_dlss/raster_dlss_prepare.comp.slang
+new file mode 100644
+index 00000000..db08563c
+--- /dev/null
++++ b/src/dxvk/shaders/rtx/pass/raster_dlss/raster_dlss_prepare.comp.slang
+@@ -0,0 +1,68 @@
++/*
++* Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
++*
++* Permission is hereby granted, free of charge, to any person obtaining a
++* copy of this software and associated documentation files (the "Software"),
++* to deal in the Software without restriction, including without limitation
++* the rights to use, copy, modify, merge, publish, distribute, sublicense,
++* and/or sell copies of the Software, and to permit persons to whom the
++* Software is furnished to do so, subject to the following conditions:
++*
++* The above copyright notice and this permission notice shall be included in
++* all copies or substantial portions of the Software.
++*
++* THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++* IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++* FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
++* THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++* LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
++* FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
++* DEALINGS IN THE SOFTWARE.
++*/
++#include "rtx/pass/raster_dlss/raster_dlss_prepare.h"
++
++layout(binding = RASTER_DLSS_DEPTH_INPUT)
++Texture2D<float> RasterDepth;
++
++layout(r32f, binding = RASTER_DLSS_DEPTH_OUTPUT)
++RWTexture2D<float> DlssDepth;
++
++layout(rg16f, binding = RASTER_DLSS_MOTION_OUTPUT)
++RWTexture2D<float2> DlssMotion;
++
++layout(push_constant)
++ConstantBuffer<RasterDlssPrepareArgs> cb;
++
++[shader("compute")]
++[numthreads(RASTER_DLSS_TILE_SIZE, RASTER_DLSS_TILE_SIZE, 1)]
++void main(in uint2 pixel : SV_DispatchThreadID) {
++  if (any(pixel >= cb.resolution)) {
++    return;
++  }
++
++  const float depth = RasterDepth[pixel];
++  DlssDepth[pixel] = depth;
++
++  if (cb.resetHistory != 0) {
++    DlssMotion[pixel] = float2(0.0f, 0.0f);
++    return;
++  }
++
++  const float2 uv = (float2(pixel) + 0.5f) / float2(cb.resolution);
++  const float2 rasterNdc =
++    uv * float2(2.0f, -2.0f) + float2(-1.0f, 1.0f);
++  const float2 currentNdc = rasterNdc - cb.currentJitterNdc;
++  const float4 currentClip =
++    float4(currentNdc, depth, 1.0f);
++  const float4 previousClip = mul(cb.clipToPrevClip, currentClip);
++
++  if (abs(previousClip.w) < 1.0e-7f) {
++    DlssMotion[pixel] = float2(0.0f, 0.0f);
++    return;
++  }
++
++  const float2 previousNdc = previousClip.xy / previousClip.w;
++  const float2 motionNdc = previousNdc - currentNdc;
++  DlssMotion[pixel] =
++    motionNdc * float2(0.5f, -0.5f) * float2(cb.resolution);
++}
+diff --git a/src/dxvk/shaders/rtx/pass/raster_dlss/raster_dlss_prepare.h b/src/dxvk/shaders/rtx/pass/raster_dlss/raster_dlss_prepare.h
+new file mode 100644
+index 00000000..571e59a1
+--- /dev/null
++++ b/src/dxvk/shaders/rtx/pass/raster_dlss/raster_dlss_prepare.h
+@@ -0,0 +1,38 @@
++/*
++* Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
++*
++* Permission is hereby granted, free of charge, to any person obtaining a
++* copy of this software and associated documentation files (the "Software"),
++* to deal in the Software without restriction, including without limitation
++* the rights to use, copy, modify, merge, publish, distribute, sublicense,
++* and/or sell copies of the Software, and to permit persons to whom the
++* Software is furnished to do so, subject to the following conditions:
++*
++* The above copyright notice and this permission notice shall be included in
++* all copies or substantial portions of the Software.
++*
++* THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++* IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++* FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
++* THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++* LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
++* FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
++* DEALINGS IN THE SOFTWARE.
++*/
++#pragma once
++
++#include "rtx/utility/shader_types.h"
++
++#define RASTER_DLSS_DEPTH_INPUT   0
++#define RASTER_DLSS_DEPTH_OUTPUT  1
++#define RASTER_DLSS_MOTION_OUTPUT 2
++
++#define RASTER_DLSS_TILE_SIZE 16
++
++struct RasterDlssPrepareArgs {
++  mat4 clipToPrevClip;
++  uvec2 resolution;
++  vec2 currentJitterNdc;
++  uint resetHistory;
++  uint padding;
++};

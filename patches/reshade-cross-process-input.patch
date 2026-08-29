@@ -1,0 +1,107 @@
+diff --git a/source/input.cpp b/source/input.cpp
+index 6600e4c..bcafe41 100644
+--- a/source/input.cpp
++++ b/source/input.cpp
+@@ -6,8 +6,8 @@
+ #include "input.hpp"
+ #include <cassert>
+ 
+-reshade::input::input(window_handle window)
+-	: _window(window)
++reshade::input::input(window_handle window, bool poll_cross_process)
++	: _window(window), _poll_cross_process(poll_cross_process)
+ {
+ }
+ 
+diff --git a/source/input.hpp b/source/input.hpp
+index 7f09ac2..81f071c 100644
+--- a/source/input.hpp
++++ b/source/input.hpp
+@@ -112,7 +112,7 @@ namespace reshade
+ 		/// </summary>
+ 		using window_handle = void *;
+ 
+-		explicit input(window_handle window);
++		explicit input(window_handle window, bool poll_cross_process = false);
+ 
+ 		/// <summary>
+ 		/// Registers a window using raw input with the input manager.
+@@ -213,6 +213,7 @@ namespace reshade
+ 
+ 		std::recursive_mutex _mutex;
+ 		window_handle _window;
++		bool _poll_cross_process = false;
+ 		bool _block_mouse = false;
+ 		bool _block_keyboard = false;
+ 		bool _block_cursor_warping = false;
+diff --git a/source/input_windows.cpp b/source/input_windows.cpp
+index d022aeb..d198b38 100644
+--- a/source/input_windows.cpp
++++ b/source/input_windows.cpp
+@@ -26,6 +26,7 @@ static std::atomic<bool> s_block_keyboard = false;
+ static std::atomic<bool> s_block_cursor_warping = false;
+ 
+ extern "C" BOOL WINAPI HookClipCursor(const RECT *lpRect);
++extern "C" BOOL WINAPI HookGetCursorPosition(LPPOINT lpPoint);
+ extern "C" auto WINAPI HookGetKeyState(int vKey) -> SHORT;
+ extern "C" auto WINAPI HookGetAsyncKeyState(int vKey) -> SHORT;
+ 
+@@ -73,8 +74,13 @@ std::shared_ptr<reshade::input> reshade::input::register_window(window_handle wi
+ 	GetWindowThreadProcessId(static_cast<HWND>(window), &process_id);
+ 	if (process_id != GetCurrentProcessId())
+ 	{
+-		reshade::log::message(reshade::log::level::warning, "Cannot capture input for window %p created by a different process (%lu).", window, process_id);
+-		return nullptr;
++		// RTX Remix and similar render bridges create the graphics swapchain in a
++		// helper process while presenting into the original game's HWND. Window
++		// messages cannot be subclassed across that process boundary, but physical
++		// keyboard/mouse state and screen-to-client cursor conversion are still
++		// available. Fall back to polling so the overlay remains interactive.
++		reshade::log::message(reshade::log::level::info, "Using cross-process polling input for window %p created by process %lu.", window, process_id);
++		return std::make_shared<input>(window, true);
+ 	}
+ 
+ 	const std::unique_lock<std::shared_mutex> lock(s_windows_mutex);
+@@ -304,6 +310,7 @@ void reshade::input::next_frame()
+ {
+ 	static const auto GetKeyState_trampoline = reshade::hooks::is_hooked(GetKeyState) ? reshade::hooks::call(HookGetKeyState, GetKeyState) : GetKeyState;
+ 	static const auto GetAsyncKeyState_trampoline = reshade::hooks::is_hooked(GetAsyncKeyState) ? reshade::hooks::call(HookGetAsyncKeyState, GetAsyncKeyState) : GetAsyncKeyState;
++	static const auto GetCursorPosition_trampoline = reshade::hooks::is_hooked(GetCursorPos) ? reshade::hooks::call(HookGetCursorPosition, GetCursorPos) : GetCursorPos;
+ 
+ 	_frame_count++;
+ 
+@@ -313,6 +320,34 @@ void reshade::input::next_frame()
+ 	for (uint8_t &state : _keys)
+ 		state &= ~0x08;
+ 
++	if (_poll_cross_process)
++	{
++		// Poll only while the target game owns the foreground window. This avoids
++		// opening or operating the overlay from input intended for another app.
++		const HWND target = static_cast<HWND>(_window);
++		const HWND foreground = GetForegroundWindow();
++		const bool is_foreground =
++			foreground == target ||
++			(foreground != nullptr && GetAncestor(foreground, GA_ROOT) == GetAncestor(target, GA_ROOT));
++
++		for (unsigned int i = 1; i < 256; ++i)
++		{
++			const bool was_down = (_last_keys[i] & 0x80) != 0;
++			const bool is_down = is_foreground && (GetAsyncKeyState_trampoline(i) & 0x8000) != 0;
++			_keys[i] = is_down ? (was_down ? 0x80 : 0x88) : (was_down ? 0x08 : 0x00);
++			if (is_down && !was_down)
++				_keys_time[i] = GetTickCount();
++		}
++
++		POINT cursor = {};
++		if (GetCursorPosition_trampoline(&cursor))
++		{
++			ScreenToClient(target, &cursor);
++			_mouse_position[0] = static_cast<unsigned int>(std::max<LONG>(0, cursor.x));
++			_mouse_position[1] = static_cast<unsigned int>(std::max<LONG>(0, cursor.y));
++		}
++	}
++
+ 	// Reset any pressed down key states (apart from mouse buttons) that have not been updated for more than 5 seconds
+ 	// Do not check mouse buttons here, since 'GetAsyncKeyState' always returns the state of the physical mouse buttons, not the logical ones in case they were remapped
+ 	// See https://docs.microsoft.com/windows/win32/api/winuser/nf-winuser-getasynckeystate
